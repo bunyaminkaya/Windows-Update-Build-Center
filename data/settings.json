@@ -1,0 +1,39 @@
+{
+  "general": {
+    "open_last_page": true,
+    "last_page": "Microsoft Güncelleme Merkezi",
+    "check_tracker_on_start": true,
+    "run_in_background": false,
+    "minimize_to_tray": false,
+    "start_with_windows": false
+  },
+  "downloads": {
+    "default_folder": "",
+    "max_concurrent": 3,
+    "open_folder_on_complete": false,
+    "resume_incomplete": true,
+    "duplicate_policy": "Benzersiz ad oluştur"
+  },
+  "uup_iso": {
+    "default_architecture": "Sistem varsayılanı",
+    "default_language": "Sistem varsayılanı",
+    "default_edition": "Windows 11 Pro",
+    "work_folder": "",
+    "output_folder": "",
+    "open_iso_folder_on_complete": false,
+    "clean_temp_files": false
+  },
+  "usb_media": {
+    "partition_scheme": "GPT",
+    "file_system": "Otomatik",
+    "bypass_hardware_checks": false
+  },
+  "build_tracker": {
+    "source_url": "https://bunyaminkaya.com/windows-build-tracker/",
+    "refresh_on_start": true,
+    "refresh_interval_minutes": 60
+  },
+  "advanced": {
+    "confirm_destructive_actions": true
+  }
+}

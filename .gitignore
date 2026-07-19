@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Runtime data
+logs/
+data/app.db
+data/official_build_cache.json
+data/download_state.json
+data/*.tmp
+
+# User/local settings backups
+*.bak
+*.backup
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Downloaded/generated Windows media
+*.iso
+*.wim
+*.esd
+*.msu
+*.cab
+*.appx
+*.msix
+*.zip.part
+*.part
+
+# UUP / converter working folders
+UUPs/
+UUP_*/
+MDL_ISO_*/
+uup-converter*/
+.build_venv/
+EXE_Build.log
