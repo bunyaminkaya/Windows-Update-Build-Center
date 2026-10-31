@@ -6,20 +6,28 @@
 
 Windows Update & Build Center is a Windows desktop application for discovering Windows builds, searching official Microsoft update packages, downloading UUP/KB content, managing downloads, creating ISO media and preparing bootable USB installation drives from a single interface.
 
-**Current version:** v5.58  
+**Current version:** v6.05  
 **Developer:** Bünyamin KAYA  
 **Website:** bunyaminkaya.com  
 **Contact:** bunyaminkaya@gmail.com
 
 ## Main features
 
+- **UUP Center v6** — Latest build list, version/channel/architecture filters, multi-language and edition selection, resumable UUP downloads, automatic ISO creation and ISO SHA-256 validation.
+- **Startup reliability** — A failed optional page no longer prevents the main window from opening; startup errors are logged and surfaced to the user.
+
 - **Microsoft Update Center** — Search Microsoft Update Catalog by KB or Windows build number and access official packages.
 - **Windows Build Tracker** — Follow current Windows build and KB records using the tracker data published on bunyaminkaya.com.
 - **UUP Center** — Find UUP packages and create Windows ISO media.
 - **Download Manager** — Queue, pause, resume, retry and monitor multiple downloads.
 - **USB Installation Center** — Prepare bootable Windows installation media with GPT/MBR and FAT32/NTFS options.
+- **Languages** — Turkish and English (Settings > General > Language; automatic by default, follows the Windows display language).
+- **Driver Backup** — Back up third-party (OEM) drivers with `pnputil`, copy them onto the installation USB and restore them after a clean install.
 - **Windows 11 compatibility options** — Optional TPM 2.0, Secure Boot and minimum RAM requirement bypass when preparing installation media.
 - **Integrated feedback** — Send bug reports, suggestions and recommendations from the application.
+- **System & Update Center (6–12)** — Hardware/update compatibility, installed KB inventory, Build Tracker gap checks, KB/package detail and automatic package scoring.
+- **Download security gate** — Microsoft HTTPS/source validation before download and automatic SHA-256 + signature verification after download.
+- **Safe installation** — Verified-package-only installation, restore-point option, admin check, MSU/CAB/EXE handling, reboot detection and Turkish error explanations.
 
 ## Requirements
 

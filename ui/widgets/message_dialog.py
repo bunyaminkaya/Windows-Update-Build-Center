@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from PySide6.QtCore import Qt
+
+from ui import styles
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -113,7 +115,7 @@ class MessageDialog(QDialog):
         layout.addLayout(button_row)
 
         self.setStyleSheet(
-            """
+            styles.qss("""
             QDialog { background: #F3F7FC; color: #14213D; }
             QFrame#modernDialogCard {
                 background: #FFFFFF;
@@ -133,7 +135,7 @@ class MessageDialog(QDialog):
             QFrame#dialogSeparator { color: #E1E9F3; }
             QPushButton {
                 background: #FFFFFF;
-                color: #1E67D8;
+                color: @BLUE@;
                 border: 1px solid #BFD1E8;
                 border-radius: 7px;
                 padding: 8px 16px;
@@ -141,9 +143,9 @@ class MessageDialog(QDialog):
             }
             QPushButton:hover { background: #EEF5FF; border-color: #8FB3E7; }
             QPushButton[dialogRole="primary"] {
-                background: #246BD8;
+                background: @BLUE@;
                 color: #FFFFFF;
-                border-color: #246BD8;
+                border-color: @BLUE@;
             }
             QPushButton[dialogRole="primary"]:hover { background: #1D5FC5; }
             QPushButton[dialogRole="danger"] {
@@ -152,7 +154,7 @@ class MessageDialog(QDialog):
                 border-color: #F1A8A8;
             }
             QPushButton[dialogRole="danger"]:hover { background: #FFF0F0; }
-            """
+            """)
         )
 
     def _finish(self, key: str):

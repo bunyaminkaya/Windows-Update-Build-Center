@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from app.paths import DATA_DIR
 
 TRACKER_URL = "https://bunyaminkaya.com/windows-build-tracker/"
+TRACKER_REST_URL = "https://bunyaminkaya.com/wp-json/wp/v2/pages/58984"
 CACHE_PATH = DATA_DIR / "build_tracker_cache.json"
 
 MONTHS_TR = {
@@ -48,6 +49,23 @@ class BuildTrackerRecord:
                 self.article_title,
             ]
         ).lower()
+
+
+@dataclass
+class BuildChangeDetails:
+    added_features: list[str]
+    fixed_issues: list[str]
+    known_issues: list[str]
+    source_url: str = ""
+
+
+@dataclass
+class KnownIssue:
+    description: str
+    affected_versions: str
+    status: str
+    workaround: str
+    source_url: str
 
 
 class BuildTrackerService:
@@ -120,22 +138,55 @@ class BuildTrackerService:
             return f"{int(match.group(3)):04d}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
         return ""
 
-    def fetch(self) -> tuple[list[BuildTrackerRecord], str]:
+    def _download_html(self) -> str:
         # WordPress/CDN sayfa önbelleği nedeniyle eski tracker HTML'i dönmemesi için
         # her canlı kontrolde benzersiz sorgu parametresi kullanılır.
         cache_buster = str(int(time() * 1000))
-        response = self.session.get(
-            TRACKER_URL,
-            params={"mdl_refresh": cache_buster},
-            headers={
-                "Cache-Control": "no-cache, no-store, max-age=0",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+        page_error: Exception | None = None
+        try:
+            response = self.session.get(
+                TRACKER_URL,
+                params={"mdl_refresh": cache_buster},
+                headers=headers,
+                timeout=(10, 35),
+            )
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or "utf-8"
+            if "bk-wbt-card" in response.text:
+                return response.text
+            page_error = RuntimeError("Ana sayfa Build Tracker kartlarını içermiyor.")
+        except Exception as exc:
+            page_error = exc
+
+        # Cloudflare veya bir güvenlik eklentisi normal sayfa isteğini engellerse
+        # aynı sayfanın WordPress REST içeriğini ikinci, bağımsız kaynak olarak kullan.
+        try:
+            response = self.session.get(
+                TRACKER_REST_URL,
+                params={"context": "view", "_": cache_buster},
+                headers={**headers, "Accept": "application/json"},
+                timeout=(10, 35),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            html = str((payload.get("content") or {}).get("rendered") or "")
+            if "bk-wbt-card" not in html:
+                raise RuntimeError("WordPress REST yanıtında Build Tracker kartı yok.")
+            return html
+        except Exception as rest_error:
+            raise RuntimeError(
+                "Build Tracker verisi hem sayfadan hem WordPress veri uç noktasından alınamadı. "
+                f"Sayfa: {page_error}; REST: {rest_error}"
+            ) from rest_error
+
+    def fetch(self) -> tuple[list[BuildTrackerRecord], str]:
+        soup = BeautifulSoup(self._download_html(), "html.parser")
 
         records: list[BuildTrackerRecord] = []
         seen: set[tuple[str, str, str, str]] = set()
@@ -204,6 +255,138 @@ class BuildTrackerService:
         last_update = self._extract_last_update(soup)
         self._save_cache(records, last_update)
         return records, last_update
+
+    @staticmethod
+    def _change_section_kind(heading: str) -> str:
+        value = heading.casefold()
+        if any(word in value for word in ("bilinen sorun", "known issue")):
+            return "known_issues"
+        if any(word in value for word in ("düzelt", "iyileştirme", "fix", "resolved issue")):
+            return "fixed_issues"
+        if any(word in value for word in ("yenilik", "yeni özellik", "öne çıkan", "what's new", "new feature")):
+            return "added_features"
+        return ""
+
+    @staticmethod
+    def _clean_change_item(value: str) -> str:
+        value = " ".join((value or "").split())
+        return value[:500].strip()
+
+    def fetch_change_details(self, record: BuildTrackerRecord) -> BuildChangeDetails:
+        """İlgili makale/resmî kaynaktaki yapılandırılmış değişiklik başlıklarını okur."""
+        buckets: dict[str, list[str]] = {
+            "added_features": [], "fixed_issues": [], "known_issues": [],
+        }
+        used_source = ""
+        urls = [url for url in (record.article_url, record.microsoft_url) if url]
+        for url in urls:
+            try:
+                response = self.session.get(url, timeout=(8, 22))
+                response.raise_for_status()
+                response.encoding = response.apparent_encoding or "utf-8"
+                soup = BeautifulSoup(response.text, "html.parser")
+                root = soup.select_one(".entry-content .content-inner, .entry-content, article, main") or soup
+                found_here = False
+                for heading in root.select("h2, h3, h4"):
+                    kind = self._change_section_kind(self._text(heading))
+                    if not kind:
+                        continue
+                    for node in heading.find_all_next():
+                        if node is not heading and node.name in ("h2", "h3", "h4"):
+                            break
+                        if node.name == "li":
+                            text = self._clean_change_item(self._text(node))
+                            if text and text not in buckets[kind]:
+                                buckets[kind].append(text)
+                                found_here = True
+                        elif node.name == "p" and not node.find_parent("li"):
+                            text = self._clean_change_item(self._text(node))
+                            if len(text) >= 25 and text not in buckets[kind]:
+                                buckets[kind].append(text)
+                                found_here = True
+                        if len(buckets[kind]) >= 12:
+                            break
+                if found_here:
+                    used_source = url
+                    break
+            except Exception:
+                continue
+
+        # Tracker özeti kaybolmasın; yapılandırılmış yenilik başlığı bulunamadığında
+        # bunu yalnızca genel değişiklik özeti olarak ilk bölümde göster.
+        if not buckets["added_features"] and record.description:
+            buckets["added_features"].append(record.description)
+        return BuildChangeDetails(source_url=used_source, **buckets)
+
+    @staticmethod
+    def _issue_status(text: str) -> str:
+        value = (text or "").casefold()
+        if any(word in value for word in ("resolved", "çözüldü", "fixed", "düzeltildi")):
+            return "Çözüldü"
+        if any(word in value for word in ("mitigated", "hafifletildi")):
+            return "Etkisi azaltıldı"
+        if any(word in value for word in ("investigating", "araştırılıyor", "working on a resolution")):
+            return "Araştırılıyor"
+        return "Devam ediyor"
+
+    def fetch_known_issues(self, record: BuildTrackerRecord) -> list[KnownIssue]:
+        """Seçili build için Microsoft'un yayımladığı bilinen sorunları okur."""
+        source_url = (record.microsoft_url or "").strip()
+        if not source_url:
+            return []
+        response = self.session.get(source_url, timeout=(8, 25))
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(response.text, "html.parser")
+        root = soup.select_one("main, article, .content") or soup
+        issues: list[KnownIssue] = []
+        affected = f"Windows 11 {record.windows_version}".strip()
+
+        for heading in root.select("h2, h3, h4"):
+            if not self._change_section_kind(self._text(heading)) == "known_issues":
+                continue
+            section_nodes = []
+            for node in heading.find_all_next():
+                if node is not heading and node.name in ("h2", "h3", "h4"):
+                    break
+                section_nodes.append(node)
+
+            tables = [node for node in section_nodes if node.name == "table"]
+            for table in tables:
+                headers = [self._text(cell).casefold() for cell in table.select("thead th")]
+                for row in table.select("tbody tr"):
+                    cells = [self._clean_change_item(self._text(cell)) for cell in row.select("th, td")]
+                    if not cells:
+                        continue
+                    mapped = {headers[i]: cells[i] for i in range(min(len(headers), len(cells)))}
+                    description = next((v for k, v in mapped.items() if any(x in k for x in ("symptom", "issue", "sorun", "belirti"))), cells[0])
+                    workaround = next((v for k, v in mapped.items() if any(x in k for x in ("workaround", "resolution", "geçici", "çözüm"))), cells[1] if len(cells) > 1 else "Microsoft tarafından geçici çözüm yayımlanmadı.")
+                    status_text = " ".join(cells)
+                    issues.append(KnownIssue(description, affected or "—", self._issue_status(status_text), workaround, source_url))
+
+            if not issues:
+                texts = []
+                for node in section_nodes:
+                    if node.name in ("p", "li") and not node.find_parent("table"):
+                        text = self._clean_change_item(self._text(node))
+                        if len(text) >= 25 and text not in texts:
+                            texts.append(text)
+                for text in texts[:10]:
+                    normalized = text.casefold()
+                    if any(phrase in normalized for phrase in (
+                        "not currently aware of any issues",
+                        "not aware of any issues",
+                        "herhangi bir sorun bilinmemektedir",
+                        "bir soruna dair bilgi almamıştır",
+                        "bilinen bir sorun yoktur",
+                    )):
+                        continue
+                    issues.append(KnownIssue(
+                        text, affected or "—", self._issue_status(text),
+                        "Microsoft tarafından ayrı bir geçici çözüm yayımlanmadı.", source_url,
+                    ))
+            break
+        return issues
 
     @staticmethod
     def _save_cache(records: list[BuildTrackerRecord], last_update: str) -> None:

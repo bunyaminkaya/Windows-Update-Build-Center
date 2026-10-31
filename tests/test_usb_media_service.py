@@ -288,3 +288,107 @@ def test_split_wim_command_uses_scratch_dir(monkeypatch, tmp_path):
     parts = UsbMediaService._split_wim_to_workspace(install, workspace, progress=lambda _m: None)
     assert parts
     assert any(str(arg).startswith("/ScratchDir:") for arg in captured["args"])
+
+
+# ---- Kurulum özelleştirme (autounattend.xml) ve ISO SHA-256 ----
+import hashlib
+import xml.etree.ElementTree as ET
+
+import pytest
+
+from services.usb_media_service import InstallCustomization, normalize_sha256
+
+_NS = {"u": "urn:schemas-microsoft-com:unattend"}
+
+
+def _passes(xml: str) -> dict:
+    root = ET.fromstring(xml.split("?>", 1)[1])
+    return {s.get("pass"): s for s in root.findall("u:settings", _NS)}
+
+
+def test_empty_customization_has_no_settings():
+    c = InstallCustomization()
+    assert c.is_empty
+    assert _passes(c.build_xml()) == {}
+
+
+def test_bypass_only_matches_previous_profile():
+    xml = InstallCustomization(bypass_hardware=True).build_xml()
+    assert set(_passes(xml)) == {"windowsPE"}
+    for key in ("BypassTPMCheck", "BypassSecureBootCheck", "BypassRAMCheck"):
+        assert key in xml
+
+
+def test_full_customization_is_well_formed_and_complete():
+    xml = InstallCustomization(True, "Ali", True, "PC-01").build_xml()
+    passes = _passes(xml)
+    assert set(passes) == {"windowsPE", "specialize", "oobeSystem"}
+    assert "<ComputerName>PC-01</ComputerName>" in xml
+    assert "<HideOnlineAccountScreens>true</HideOnlineAccountScreens>" in xml
+    assert "<ProtectYourPC>3</ProtectYourPC>" in xml
+    assert "<Name>Ali</Name>" in xml
+    assert "HideEULAPage" not in xml  # lisans sayfası kullanıcı adına geçilmez
+
+
+def test_account_name_is_xml_escaped_and_utf8():
+    xml = InstallCustomization(local_account="Çağrı&Co").build_xml()
+    assert "&amp;" in xml
+    ET.fromstring(xml.split("?>", 1)[1])  # geçerli XML
+
+
+@pytest.mark.parametrize("name", ["", "a" * 21, "bad/name", "Ad:Soyad", "Administrator", "guest", "..", " x"])
+def test_invalid_account_names_rejected(name):
+    if name == "":
+        return  # boş = özellik kapalı
+    with pytest.raises(ValueError):
+        InstallCustomization(local_account=name).validate()
+
+
+@pytest.mark.parametrize("name", ["a" * 16, "PC_01", "Çalışma", "12345", "-pc", "pc-", "my pc"])
+def test_invalid_computer_names_rejected(name):
+    with pytest.raises(ValueError):
+        InstallCustomization(computer_name=name).validate()
+
+
+def test_valid_computer_names_accepted():
+    for name in ("PC-01", "DESKTOP", "a1"):
+        InstallCustomization(computer_name=name).validate()
+
+
+def test_architecture_detection_from_iso_name():
+    from pathlib import Path
+    d = UsbMediaService.detect_architecture
+    assert d(Path("Win11_24H2_Turkish_x64.iso")) == "amd64"
+    assert d(Path("Win11_ARM64.iso")) == "arm64"
+    assert d(Path("Win10_x86.iso")) == "x86"
+    assert d(Path("windows.iso")) == "amd64"
+
+
+def test_normalize_sha256():
+    good = "ab" * 32
+    assert normalize_sha256("") == ""
+    assert normalize_sha256(" " + good.upper() + " \n") == good.upper()
+    assert normalize_sha256("-".join([good[i:i + 8] for i in range(0, 64, 8)])) == good.upper()
+    with pytest.raises(ValueError):
+        normalize_sha256("123")
+    with pytest.raises(ValueError):
+        normalize_sha256("g" * 64)
+
+
+def test_sha256_compute_and_verify(tmp_path):
+    f = tmp_path / "x.iso"
+    f.write_bytes(b"windows" * 100000)
+    want = hashlib.sha256(f.read_bytes()).hexdigest().upper()
+    seen = []
+    assert UsbMediaService.compute_sha256(f, lambda p, t: seen.append(p)) == want
+    assert seen[-1] == 100
+    assert UsbMediaService.verify_iso_sha256(f, want.lower()) == want
+    with pytest.raises(RuntimeError, match="USB'ye dokunulmadı"):
+        UsbMediaService.verify_iso_sha256(f, "0" * 64)
+
+
+def test_sha256_can_be_cancelled(tmp_path):
+    f = tmp_path / "x.iso"
+    f.write_bytes(b"a" * 1000)
+    with pytest.raises(RuntimeError, match="iptal"):
+        UsbMediaService.compute_sha256(f, cancelled=lambda: True)

@@ -3,17 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QFrame, QSizePolicy, QMenu, QAbstractItemView, QTextEdit, QDialog,
-    QGridLayout, QFileDialog
+    QGridLayout, QFileDialog, QStackedWidget
 )
+
+from ui import icons, styles
+from ui.theme import raw_qcolor
 
 from services.download_manager import DownloadManager
 from services.iso_build_manager import IsoBuildManager
+from ui.widgets.iso_build_panel import IsoBuildPanel
 from ui.widgets.modern_combo_box import ModernComboBox
 from ui.widgets.message_dialog import show_information, show_warning, show_error, ask_confirmation, ask_choice, DialogAction
 
@@ -68,7 +72,7 @@ class IsoProgressDialog(QDialog):
         self.resize(1080, 620)
         self.setMinimumSize(920, 520)
 
-        self.setStyleSheet("""
+        self.setStyleSheet(styles.qss("""
             QDialog#isoProgressDialog {
                 background: #F4F7FB;
                 color: #14213D;
@@ -78,17 +82,6 @@ class IsoProgressDialog(QDialog):
                 border: 1px solid #DCE5F0;
                 border-radius: 14px;
             }
-            QLabel#pageTitle {
-                color: #0B1736;
-                font-size: 28px;
-                font-weight: 700;
-                background: transparent;
-            }
-            QLabel#pageSubtitle {
-                color: #65728A;
-                font-size: 14px;
-                background: transparent;
-            }
             QPushButton {
                 min-height: 38px;
                 padding: 0 18px;
@@ -97,9 +90,9 @@ class IsoProgressDialog(QDialog):
                 font-weight: 600;
             }
             QPushButton#primaryButton {
-                background: #2167D5;
+                background: @BLUE@;
                 color: #FFFFFF;
-                border: 1px solid #2167D5;
+                border: 1px solid @BLUE@;
             }
             QPushButton#primaryButton:hover {
                 background: #1859C0;
@@ -107,7 +100,7 @@ class IsoProgressDialog(QDialog):
             }
             QPushButton#secondaryButton {
                 background: #FFFFFF;
-                color: #2167D5;
+                color: @BLUE@;
                 border: 1px solid #BFD0E6;
             }
             QPushButton#secondaryButton:hover {
@@ -153,8 +146,8 @@ class IsoProgressDialog(QDialog):
             }
             QLabel#isoStageActive {
                 color: #FFFFFF;
-                background: #2167D5;
-                border: 1px solid #2167D5;
+                background: @BLUE@;
+                border: 1px solid @BLUE@;
                 border-radius: 9px;
                 padding: 8px 10px;
                 font-size: 11px;
@@ -179,7 +172,7 @@ class IsoProgressDialog(QDialog):
                 min-height: 26px;
             }
             QProgressBar#isoBuildProgress::chunk {
-                background: #2167D5;
+                background: @BLUE@;
                 border-radius: 9px;
             }
             QTextEdit#isoLogView {
@@ -190,14 +183,14 @@ class IsoProgressDialog(QDialog):
                 padding: 10px;
                 font-family: Consolas, "Courier New", monospace;
                 font-size: 11px;
-                selection-background-color: #2167D5;
+                selection-background-color: @BLUE@;
             }
             QLabel#statNote {
                 color: #7D8A9E;
                 font-size: 11px;
                 background: transparent;
             }
-        """)
+        """))
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(18, 18, 18, 18)
@@ -345,28 +338,56 @@ class DownloadManagerPage(QWidget):
         self._iso_elapsed_timer.setInterval(1000)
         self._iso_elapsed_timer.timeout.connect(self._refresh_iso_time_labels)
 
+        self.setObjectName("dmPage")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setContentsMargins(26, 22, 26, 22)
         layout.setSpacing(14)
 
+        # ── Başlık ──
+        header_row = QHBoxLayout()
+        header_row.setSpacing(14)
+        head_icon = QLabel()
+        head_icon.setPixmap(icons.pixmap("cloud-down", "#1768E0", 46, stroke=1.9))
+        head_icon.setFixedSize(58, 58)
+        head_icon.setAlignment(Qt.AlignCenter)
+        header_row.addWidget(head_icon, 0, Qt.AlignTop)
+        head_text = QVBoxLayout()
+        head_text.setSpacing(2)
+        page_title = QLabel("İndirme Yöneticisi")
+        page_title.setObjectName("dmTitle")
         subtitle = QLabel(
-            "Microsoft paketlerinin indirme durumunu tek ekranda yönetin. "
-            "Aktif indirmeleri izleyin, kuyruğu kontrol edin ve dosyaları kolayca yönetin."
+            "Devam eden indirmeleri izleyin, kuyruğu duraklatın, sürdürün veya iptal edin."
         )
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
+        head_text.addWidget(page_title)
+        head_text.addWidget(subtitle)
+        header_row.addLayout(head_text, 1)
+        self.refresh_button = QPushButton("Yenile")
+        self.refresh_button.setObjectName("dmPrimary")
+        self.refresh_button.setIcon(self._dm_icon("refresh", "#FFFFFF"))
+        self.refresh_button.setIconSize(QSize(18, 18))
+        self.refresh_button.setCursor(Qt.PointingHandCursor)
+        self.refresh_button.setToolTip("Listeyi yeniden çiz")
+        self.refresh_button.clicked.connect(lambda: self._rebuild_table())
+        header_row.addWidget(self.refresh_button, 0, Qt.AlignTop)
+        layout.addLayout(header_row)
 
+        # Mantık tarafı bu etiketi güncellemeye devam eder; görünümde gösterilmez.
         self.summary = QLabel("Henüz indirme yok.")
         self.summary.setObjectName("infoBox")
-        layout.addWidget(self.summary)
+        self.summary.setVisible(False)
 
         stats_row = QHBoxLayout()
-        stats_row.setSpacing(12)
-        self.total_value = self._build_stat_card(stats_row, "Toplam", "0", "Tüm indirme kayıtları")
-        self.active_value = self._build_stat_card(stats_row, "İndiriliyor", "0", "Şu anda aktif bağlantılar")
-        self.waiting_value = self._build_stat_card(stats_row, "Kuyrukta", "0", "Sırada bekleyen dosyalar")
-        self.completed_value = self._build_stat_card(stats_row, "Tamamlandı", "0", "Başarıyla biten dosyalar")
+        stats_row.setSpacing(14)
+        self.total_value = self._build_stat_card(
+            stats_row, "Toplam", "0", "Toplam indirme sayısı", "doc", "#1768E0", "#E3EEFC")
+        self.active_value = self._build_stat_card(
+            stats_row, "İndiriliyor", "0", "Aktif indirme sayısı", "download", "#1FA463", "#DFF5E9")
+        self.waiting_value = self._build_stat_card(
+            stats_row, "Kuyrukta", "0", "Bekleyen indirme sayısı", "clock", "#E8891B", "#FDEBD3")
+        self.completed_value = self._build_stat_card(
+            stats_row, "Tamamlandı", "0", "Tamamlanan indirme sayısı", "check-circle", "#1768E0", "#E3EEFC")
         layout.addLayout(stats_row)
 
         # ISO progress is shown in a separate non-modal window so the Download
@@ -392,22 +413,26 @@ class DownloadManagerPage(QWidget):
         self.iso_retry_button.clicked.connect(self._retry_iso_build)
         self.iso_change_work_button.clicked.connect(self._choose_iso_work_dir)
 
+        # ── İndirme Kuyruğu kartı ──
         queue_card = QFrame()
-        queue_card.setObjectName("detailPanel")
+        queue_card.setObjectName("dmCard")
         queue_layout = QVBoxLayout(queue_card)
-        queue_layout.setContentsMargins(14, 14, 14, 14)
-        queue_layout.setSpacing(10)
+        queue_layout.setContentsMargins(18, 16, 18, 16)
+        queue_layout.setSpacing(12)
 
+        queue_head = QHBoxLayout()
+        queue_head.setSpacing(12)
+        queue_head.addWidget(self._dm_tile("cloud-down", "#1768E0", "#E3EEFC"), 0, Qt.AlignTop)
+        queue_head_text = QVBoxLayout()
+        queue_head_text.setSpacing(1)
         queue_title = QLabel("İndirme Kuyruğu")
-        queue_title.setObjectName("detailSectionTitle")
-        queue_layout.addWidget(queue_title)
-
-        queue_note = QLabel(
-            "Duruma göre satırlar canlı güncellenir. Mavi ilerleme çubuğu aktif indirmeleri, "
-            "yeşil satırlar tamamlananları gösterir."
-        )
-        queue_note.setObjectName("subtleInfoBox")
-        queue_layout.addWidget(queue_note)
+        queue_title.setObjectName("dmCardTitle")
+        queue_note = QLabel("Microsoft paket indirmelerinizi buradan takip edebilir, işlemleri yönetebilirsiniz.")
+        queue_note.setObjectName("dmCardDesc")
+        queue_head_text.addWidget(queue_title)
+        queue_head_text.addWidget(queue_note)
+        queue_head.addLayout(queue_head_text, 1)
+        queue_layout.addLayout(queue_head)
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
@@ -422,20 +447,24 @@ class DownloadManagerPage(QWidget):
             button = QPushButton(text_value)
             button.setCheckable(True)
             button.setObjectName("filterChip")
+            button.setCursor(Qt.PointingHandCursor)
             button.clicked.connect(lambda checked=False, k=key: self._set_filter(k))
-            button.setMinimumWidth(button.sizeHint().width() + 20)
             filter_row.addWidget(button)
             self.filter_buttons[key] = button
         self.filter_buttons["all"].setChecked(True)
         filter_row.addStretch(1)
         self.iso_popup_button = QPushButton("ISO İşlemi")
-        self.iso_popup_button.setObjectName("secondaryButton")
+        self.iso_popup_button.setObjectName("dmPrimary")
+        self.iso_popup_button.setIcon(self._dm_icon("cube", "#FFFFFF"))
+        self.iso_popup_button.setIconSize(QSize(18, 18))
+        self.iso_popup_button.setCursor(Qt.PointingHandCursor)
         self.iso_popup_button.setToolTip("ISO oluşturma ilerleme penceresini aç")
         self.iso_popup_button.clicked.connect(self._show_iso_dialog)
         filter_row.addWidget(self.iso_popup_button)
         queue_layout.addLayout(filter_row)
 
         self.table = QTableWidget(0, 9)
+        self.table.setObjectName("dmTable")
         self.table.setHorizontalHeaderLabels([
             "Dosya", "Mimari", "Durum", "Sıra", "İlerleme", "İndirilen / Toplam",
             "Hız", "Kalan Süre", "Kayıt Yeri"
@@ -455,57 +484,130 @@ class DownloadManagerPage(QWidget):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_context_menu)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.setFrameShape(QFrame.NoFrame)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
+        header.setMinimumSectionSize(60)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         for col in range(1, 8):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(8, QHeaderView.Stretch)
-        queue_layout.addWidget(self.table, 1)
+        header.setFixedHeight(42)
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # "Sıra" sütunu görselde yok; veri korunur, sadece gizlenir.
+        self.table.setColumnHidden(3, True)
+
+        # Boş durum (tablo yerine gösterilir)
+        self.empty_state = QWidget()
+        self.empty_state.setObjectName("dmEmpty")
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setAlignment(Qt.AlignCenter)
+        empty_layout.setSpacing(8)
+        empty_circle = QLabel()
+        empty_circle.setObjectName("dmEmptyCircle")
+        empty_circle.setFixedSize(92, 92)
+        empty_circle.setAlignment(Qt.AlignCenter)
+        empty_circle.setPixmap(icons.pixmap("cloud-down", "#1768E0", 46, stroke=1.9))
+        empty_layout.addWidget(empty_circle, 0, Qt.AlignHCenter)
+        empty_layout.addSpacing(6)
+        self.empty_title = QLabel("Henüz indirme yok")
+        self.empty_title.setObjectName("dmEmptyTitle")
+        self.empty_title.setAlignment(Qt.AlignCenter)
+        self.empty_text = QLabel(
+            "UUP ISO Oluşturucu veya Microsoft paket kaynaklarından bir indirme "
+            "başlattığınızda burada görünecek."
+        )
+        self.empty_text.setObjectName("dmEmptyText")
+        self.empty_text.setAlignment(Qt.AlignCenter)
+        self.empty_text.setWordWrap(True)
+        empty_layout.addWidget(self.empty_title)
+        empty_layout.addWidget(self.empty_text)
+
+        self.table_stack = QStackedWidget()
+        self.table_stack.addWidget(self.table)
+        self.table_stack.addWidget(self.empty_state)
+        table_box = QFrame()
+        table_box.setObjectName("dmTableBox")
+        table_box_layout = QVBoxLayout(table_box)
+        table_box_layout.setContentsMargins(0, 0, 0, 0)
+        table_box_layout.addWidget(self.table_stack)
+        table_box.setMinimumHeight(190)
+        queue_layout.addWidget(table_box, 1)
         layout.addWidget(queue_card, 1)
 
+        # ── İndirme İşlemleri kartı ──
         footer_card = QFrame()
-        footer_card.setObjectName("detailPanel")
+        footer_card.setObjectName("dmCard")
         footer_layout = QVBoxLayout(footer_card)
-        footer_layout.setContentsMargins(14, 12, 14, 12)
+        footer_layout.setContentsMargins(18, 16, 18, 16)
         footer_layout.setSpacing(10)
 
-        footer_title = QLabel("Hızlı İşlemler")
-        footer_title.setObjectName("detailSectionTitle")
-        footer_layout.addWidget(footer_title)
+        footer_head = QHBoxLayout()
+        footer_head.setSpacing(12)
+        footer_head.addWidget(self._dm_tile("gear", "#1768E0", "#E3EEFC"), 0, Qt.AlignVCenter)
+        footer_title = QLabel("İndirme İşlemleri")
+        footer_title.setObjectName("dmCardTitle")
+        footer_head.addWidget(footer_title)
+        footer_head.addSpacing(10)
 
+        strip = QFrame()
+        strip.setObjectName("dmInfoStrip")
+        strip_layout = QHBoxLayout(strip)
+        strip_layout.setContentsMargins(14, 0, 14, 0)
+        strip_layout.setSpacing(10)
+        strip_icon = QLabel()
+        strip_icon.setPixmap(icons.pixmap("info-outline", "#1768E0", 20, stroke=1.9))
+        strip_icon.setFixedSize(22, 22)
+        strip_layout.addWidget(strip_icon)
+        self.manager.job_schedule_changed.connect(self._sync_empty_state)
         self.global_queue_status = QLabel("İndirme kuyruğu çalışıyor.")
         self.global_queue_status.setObjectName("subtleInfoBox")
-        footer_layout.addWidget(self.global_queue_status)
+        if not self.manager.status_counts().get("total", 0):
+            self.global_queue_status.setText("İndirme kuyruğu boş. Herhangi bir indirme başlatılmadı.")
+        strip_layout.addWidget(self.global_queue_status, 1)
+        strip.setFixedHeight(42)
+        footer_head.addWidget(strip, 1)
+        footer_layout.addLayout(footer_head)
 
         # Global queue controls live in the same action area as the per-file
         # controls. This keeps all IDM-style download actions in one place.
+        bulk_caption = QLabel("Toplu İşlemler")
+        bulk_caption.setObjectName("dmSection")
+        footer_layout.addWidget(bulk_caption)
+
         queue_actions = QHBoxLayout()
         queue_actions.setSpacing(10)
 
         self.pause_all_button = QPushButton("Tümünü Duraklat")
         self.resume_all_button = QPushButton("Tümünü Devam Ettir")
         self.cancel_all_button = QPushButton("Tümünü İptal Et")
-        self.cancel_all_button.setObjectName("dangerOutlineButton")
+        self.cancel_all_button.setObjectName("dmDanger")
+        self.pause_all_button.setIcon(self._dm_icon("pause", "#1768E0"))
+        self.resume_all_button.setIcon(self._dm_icon("play", "#1768E0"))
+        self.cancel_all_button.setIcon(self._dm_icon("x", "#D93C3C"))
 
         for button in (
             self.pause_all_button,
             self.resume_all_button,
             self.cancel_all_button,
         ):
-            button.setMinimumWidth(button.sizeHint().width() + 20)
+            if button.objectName() != "dmDanger":
+                button.setObjectName("dmAction")
+            button.setIconSize(QSize(18, 18))
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumWidth(button.sizeHint().width() + 24)
             button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
             queue_actions.addWidget(button)
 
         queue_actions.addStretch(1)
 
         concurrent_label = QLabel("Aynı anda")
-        concurrent_label.setObjectName("statNote")
+        concurrent_label.setObjectName("dmSection")
         queue_actions.addWidget(concurrent_label)
 
         self.concurrent_combo = ModernComboBox()
-        self.concurrent_combo.setMinimumWidth(120)
+        self.concurrent_combo.setMinimumWidth(130)
         for value in range(1, 7):
             self.concurrent_combo.addItem(f"{value} indirme", value)
         current_index = max(
@@ -517,11 +619,9 @@ class DownloadManagerPage(QWidget):
         footer_layout.addLayout(queue_actions)
 
         # Per-file actions remain directly below the global queue controls.
-        selected_info = QLabel(
-            "Seçili dosya işlemleri: tabloda bir veya birden fazla satır seçin."
-        )
-        selected_info.setObjectName("statNote")
-        footer_layout.addWidget(selected_info)
+        selected_caption = QLabel("Seçili Dosya İşlemleri")
+        selected_caption.setObjectName("dmSection")
+        footer_layout.addWidget(selected_caption)
 
         actions = QHBoxLayout()
         actions.setSpacing(10)
@@ -533,24 +633,30 @@ class DownloadManagerPage(QWidget):
         self.clear_completed_button = QPushButton("Tamamlananları Temizle")
         self.open_folder_button = QPushButton("Klasörü Aç")
 
-        compact_buttons = [
-            self.pause_button,
-            self.resume_button,
-            self.cancel_button,
-            self.retry_button,
-            self.delete_selected_button,
-            self.clear_completed_button,
-        ]
-        for button in compact_buttons:
-            button.setMinimumWidth(button.sizeHint().width() + 18)
-            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-            actions.addWidget(button)
-
-        self.open_folder_button.setMinimumWidth(150)
-        self.open_folder_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        actions.addWidget(self.open_folder_button, 1)
+        for button, icon_name, color, name in (
+            (self.pause_button, "pause", "#1768E0", "dmAction"),
+            (self.resume_button, "play", "#1768E0", "dmAction"),
+            (self.cancel_button, "x", "#D93C3C", "dmDanger"),
+            (self.retry_button, "undo", "#1768E0", "dmAction"),
+            (self.delete_selected_button, "trash", "#D93C3C", "dmDanger"),
+            (self.clear_completed_button, "check-circle", "#1768E0", "dmAction"),
+            (self.open_folder_button, "folder", "#1768E0", "dmAction"),
+        ):
+            button.setObjectName(name)
+            button.setIcon(self._dm_icon(icon_name, color))
+            button.setIconSize(QSize(18, 18))
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumWidth(button.sizeHint().width() + 16)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            actions.addWidget(button, 1)
         footer_layout.addLayout(actions)
         layout.addWidget(footer_card)
+
+        # ── ISO Oluşturma bölümü: indirme (kuyruk + işlemler) bittikten sonraki 2. aşama; iş yoksa gizli ──
+        self.iso_panel = IsoBuildPanel(self, manager=self.manager, iso_manager=self.iso_manager)
+        self.iso_panel.details_requested.connect(lambda _bid: self._show_iso_dialog())
+        self.iso_panel.iso_center_requested.connect(self._open_iso_center)
+        layout.addWidget(self.iso_panel)
 
         self.pause_button.clicked.connect(self._pause)
         self.resume_button.clicked.connect(self._resume)
@@ -583,10 +689,23 @@ class DownloadManagerPage(QWidget):
         self.iso_manager.build_cancelled.connect(self._on_iso_cancelled)
         self.table.itemSelectionChanged.connect(self._update_action_states)
 
+        # Görünüm: tablo boşken boş durum ekranını göster.
+        model = self.table.model()
+        model.rowsInserted.connect(self._sync_empty_state)
+        model.rowsRemoved.connect(self._sync_empty_state)
+        model.modelReset.connect(self._sync_empty_state)
+        self._apply_dm_styles()
+
         self._rebuild_table()
+        self._sync_empty_state()
         self._update_action_states()
         self._refresh_summary_only()
         self._update_global_action_states()
+
+    def _open_iso_center(self, _batch_id: str = ""):
+        window = self.window()
+        if hasattr(window, "show_page_by_name"):
+            window.show_page_by_name("ISO Merkezi")
 
     def _format_duration(self, seconds: float | int) -> str:
         seconds = max(0, int(seconds or 0))
@@ -1147,25 +1266,155 @@ class DownloadManagerPage(QWidget):
             f"Klasör açılamadı:\n{target}\n\n" + "\n".join(errors[-4:]),
         )
 
-    def _build_stat_card(self, parent_layout, title_text: str, value_text: str, note_text: str):
+    def _build_stat_card(self, parent_layout, title_text: str, value_text: str, note_text: str,
+                         icon_name: str = "", color: str = "#1768E0", tile_bg: str = "#E3EEFC"):
         card = QFrame()
-        card.setObjectName("statCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(14, 12, 14, 12)
-        card_layout.setSpacing(4)
+        card.setObjectName("dmStatCard")
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout.setSpacing(14)
+        if icon_name:
+            card_layout.addWidget(self._dm_tile(icon_name, color, tile_bg, 54, 28), 0, Qt.AlignVCenter)
 
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
         title = QLabel(title_text)
-        title.setObjectName("statTitle")
+        title.setObjectName("dmStatTitle")
         value = QLabel(value_text)
-        value.setObjectName("statValue")
+        value.setObjectName("dmStatValue")
         note = QLabel(note_text)
-        note.setObjectName("statNote")
-
-        card_layout.addWidget(title)
-        card_layout.addWidget(value)
-        card_layout.addWidget(note)
+        note.setObjectName("dmStatNote")
+        text_col.addWidget(title)
+        text_col.addWidget(value)
+        text_col.addWidget(note)
+        card_layout.addLayout(text_col, 1)
         parent_layout.addWidget(card, 1)
         return value
+
+    # ── Görünüm yardımcıları (mantıktan bağımsız) ──
+    @staticmethod
+    def _dm_glyph(kind: str, color: str, size: int = 36) -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(raw_qcolor()(color))
+        u = size / 36.0
+        if kind == "pause":
+            p.drawRoundedRect(QRectF(10 * u, 8 * u, 6 * u, 20 * u), 1.5 * u, 1.5 * u)
+            p.drawRoundedRect(QRectF(20 * u, 8 * u, 6 * u, 20 * u), 1.5 * u, 1.5 * u)
+        else:
+            from PySide6.QtGui import QPolygonF
+            from PySide6.QtCore import QPointF
+            p.drawPolygon(QPolygonF([QPointF(12 * u, 7 * u), QPointF(28 * u, 18 * u), QPointF(12 * u, 29 * u)]))
+        p.end()
+        return pm
+
+    def _dm_icon(self, name: str, color: str) -> QIcon:
+        def make(c):
+            if name in ("pause", "play"):
+                return self._dm_glyph(name, c)
+            return icons.pixmap(name, c, 36, stroke=2.0)
+        icon = QIcon()
+        icon.addPixmap(make(color), QIcon.Normal)
+        icon.addPixmap(make("#9AA8BF"), QIcon.Disabled)
+        return icon
+
+    def _dm_tile(self, name: str, color: str, bg: str, size: int = 48, glyph: int = 26) -> QLabel:
+        tile = QLabel()
+        tile.setFixedSize(size, size)
+        tile.setAlignment(Qt.AlignCenter)
+        tile.setStyleSheet(f"background: {bg}; border-radius: {size // 2 - 2}px;")
+        tile.setPixmap(icons.pixmap(name, color, glyph, stroke=1.9))
+        return tile
+
+    def _sync_empty_state(self, *args):
+        try:
+            empty = self.table.rowCount() == 0
+            self.table_stack.setCurrentWidget(self.empty_state if empty else self.table)
+            if empty:
+                has_jobs = bool(self.manager.status_counts().get("total", 0))
+                self.empty_title.setText("Bu filtrede indirme yok" if has_jobs else "Henüz indirme yok")
+                self.empty_text.setVisible(not has_jobs)
+            total = self.manager.status_counts().get("total", 0)
+            idle_text = "İndirme kuyruğu boş. Herhangi bir indirme başlatılmadı."
+            running_text = "İndirme kuyruğu çalışıyor."
+            schedule = self.manager.schedule_text()
+            if schedule and total and not self.manager.schedule_open():
+                self.global_queue_status.setText(schedule)
+                return
+            current = self.global_queue_status.text()
+            if total and current in (idle_text, self.manager.schedule_text()):
+                self.global_queue_status.setText(running_text)
+            elif not total and current == running_text:
+                self.global_queue_status.setText(idle_text)
+        except RuntimeError:
+            pass
+
+    def _apply_dm_styles(self):
+        self.setStyleSheet(styles.qss("""
+            QWidget#dmPage { background: #F3F7FC; }
+            QLabel { background: transparent; }
+            QLabel#dmTitle { font-size: 30px; font-weight: 700; color: #0A1F44; }
+            QFrame#dmStatCard, QFrame#dmCard {
+                background: #FFFFFF; border: 1px solid #DCE5F1; border-radius: 14px;
+            }
+            QLabel#dmStatTitle { color: #3A4D70; font-size: 13px; font-weight: 600; }
+            QLabel#dmStatValue { color: #0A1F44; font-size: 28px; font-weight: 700; }
+            QLabel#dmStatNote { color: #6B7C99; font-size: 12px; }
+            QLabel#dmCardTitle { color: #0A1F44; font-size: 17px; font-weight: 700; }
+            QLabel#dmCardDesc { color: #5F7090; font-size: 12px; }
+            QLabel#dmSection { color: #3A4D70; font-size: 13px; font-weight: 700; }
+            QFrame#dmInfoStrip { background: #EAF2FE; border: 1px solid #D5E3F8; border-radius: 10px; }
+            QLabel#subtleInfoBox { color: #1F4F9E; font-size: 13px; background: transparent; border: none; padding: 0; }
+            QLabel#infoBox { color: #5F7090; font-size: 12px; background: transparent; border: none; padding: 0; }
+            QPushButton#filterChip {
+                background: #FFFFFF; color: #3A4D70; border: 1px solid #D0DCEC; border-radius: 17px;
+                padding: 0 16px; font-size: 13px; font-weight: 600; min-height: 34px; max-height: 34px;
+            }
+            QPushButton#filterChip:hover { background: #F1F6FD; border-color: #9DB9E6; }
+            QPushButton#filterChip:checked { background: @BLUE@; color: #FFFFFF; border: 1px solid @BLUE@; }
+            QPushButton#dmPrimary {
+                background: @BLUE@; color: #FFFFFF; border: none; border-radius: 10px;
+                padding: 0 20px; font-size: 13px; font-weight: 700; min-height: 42px; max-height: 42px;
+            }
+            QPushButton#dmPrimary:hover { background: #135BC4; }
+            QPushButton#dmAction, QPushButton#dmDanger {
+                background: #FFFFFF; border: 1px solid #CBD9EC; border-radius: 10px;
+                padding: 0 8px; font-size: 12px; font-weight: 600; min-height: 40px; max-height: 40px;
+            }
+            QPushButton#dmAction { color: @BLUE@; }
+            QPushButton#dmDanger { color: #D93C3C; border-color: #F0C4C4; }
+            QPushButton#dmAction:hover { background: #F1F6FD; border-color: #9DB9E6; }
+            QPushButton#dmDanger:hover { background: #FFF4F4; }
+            QPushButton#dmAction:disabled, QPushButton#dmDanger:disabled {
+                color: #9AA8BF; background: #F4F7FB; border: 1px solid #E5ECF5;
+            }
+            QComboBox#modernComboBox {
+                background: #FFFFFF; border: 1px solid #D0DCEC; border-radius: 9px; padding: 0 28px 0 12px;
+                font-size: 13px; color: #14213D; min-height: 38px; max-height: 38px;
+            }
+            QFrame#dmTableBox { background: #FFFFFF; border: 1px solid #E3EAF4; border-radius: 12px; }
+            QWidget#dmEmpty { background: #FFFFFF; }
+            QLabel#dmEmptyCircle { background: #E3EEFC; border-radius: 46px; }
+            QLabel#dmEmptyTitle { color: #0A1F44; font-size: 20px; font-weight: 700; }
+            QLabel#dmEmptyText { color: #5F7090; font-size: 13px; }
+            QTableWidget#dmTable {
+                background: #FFFFFF; alternate-background-color: #FFFFFF; border: none; outline: none;
+                gridline-color: transparent; selection-background-color: #EAF2FE; selection-color: #14213D;
+            }
+            QTableWidget#dmTable::item { border-bottom: 1px solid #EDF1F6; padding: 4px 8px; }
+            QTableWidget#dmTable QHeaderView::section {
+                background: #F4F8FD; color: #3A4D70; border: none; padding: 0 8px;
+                font-size: 12px; font-weight: 700;
+            }
+            QProgressBar#downloadProgress {
+                border: none; background: #E3EBF6; border-radius: 7px; text-align: center;
+                color: #14213D; font-size: 11px; font-weight: 700; margin: 9px 6px; min-width: 90px;
+            }
+            QProgressBar#downloadProgress::chunk { background: #9CC2F7; border-radius: 7px; }
+        """))
 
     def _selected_job_ids(self):
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
@@ -1185,6 +1434,12 @@ class DownloadManagerPage(QWidget):
     def _status_display(self, job) -> str:
         if job.status == "İndiriliyor" and job.speed > 0:
             return "İndiriliyor"
+        if job.status == "Tamamlandı" and getattr(job, "verification_status", "") == "Doğrulandı":
+            return "Tamamlandı ✓ Doğrulandı"
+        if job.status == "Tamamlandı" and str(getattr(job, "verification_status", "")) in {"BAŞARISIZ", "Kontrol hatası"}:
+            return "Tamamlandı ⚠ Doğrulanamadı"
+        if str(getattr(job, "verification_status", "")) == "Doğrulanıyor":
+            return "Doğrulanıyor…"
         return job.status
 
     def _apply_row_style(self, row: int, job):
@@ -1369,7 +1624,11 @@ class DownloadManagerPage(QWidget):
             item.setText(str(value))
             if col == 0:
                 item.setData(Qt.UserRole, job.id)
-                item.setToolTip(job.error or job.filename)
+                verification = getattr(job, "verification_status", "")
+                if verification and verification != "Bekleniyor":
+                    item.setToolTip((job.error or job.filename) + "\n\nGüvenlik: " + verification + ("\nSHA-256: " + job.sha256 if getattr(job, "sha256", "") else ""))
+                else:
+                    item.setToolTip(job.error or job.filename)
             elif col == 8:
                 item.setToolTip(job.target_path)
 

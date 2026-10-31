@@ -227,6 +227,10 @@ class PackageService:
                         size=update.size or "—",
                         direct_url=url,
                         source="Microsoft Update Catalog",
+                        product=update.product or "",
+                        classification=update.classification or "",
+                        version=update.version or "",
+                        last_updated=update.last_updated or "",
                     )
                 )
 

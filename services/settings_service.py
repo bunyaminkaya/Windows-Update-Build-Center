@@ -12,13 +12,18 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "appearance": {"theme": "light"},
+    "iso_center": {"scan_folders": []},
     "general": {
         "open_last_page": True,
-        "last_page": "Microsoft Güncelleme Merkezi",
+        "last_page": "Güncelleme Merkezi",
         "check_tracker_on_start": True,
         "run_in_background": False,
         "minimize_to_tray": False,
         "start_with_windows": False,
+        "check_app_updates": True,
+        "show_welcome_on_start": False,
+        "language": "auto",
     },
     "downloads": {
         "default_folder": "",
@@ -26,6 +31,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "open_folder_on_complete": False,
         "resume_incomplete": True,
         "duplicate_policy": "Benzersiz ad oluştur",
+        "speed_limit_kbps": 0,
+        "schedule_enabled": False,
+        "schedule_start": "01:00",
+        "schedule_end": "07:00",
     },
     "uup_iso": {
         "default_architecture": "Sistem varsayılanı",
@@ -35,6 +44,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "output_folder": "",
         "open_iso_folder_on_complete": False,
         "clean_temp_files": False,
+        "auto_create_iso": True,   # UUP indirmesi bitince ISO'yu kendiliğinden oluştur
     },
     "usb_media": {
         "partition_scheme": "GPT",
@@ -45,9 +55,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "source_url": "https://bunyaminkaya.com/windows-build-tracker/",
         "refresh_on_start": True,
         "refresh_interval_minutes": 60,
+        "notifications_enabled": True,
+        "watchlist_enabled": False,
+        "tracked_versions": [],
+        "tracked_terms": [],
+        "notification_channels": [
+            "GA / Retail", "Release Preview", "Beta",
+            "Experimental", "Dev", "Canary",
+        ],
     },
     "advanced": {
         "confirm_destructive_actions": True,
+    },
+    "onboarding": {
+        "welcome_shown": False,
     },
 }
 
@@ -118,3 +139,11 @@ class SettingsService:
                 cls._deep_merge(target[key], value)
             else:
                 target[key] = value
+
+
+def auto_create_iso_enabled() -> bool:
+    """İndirme bitince ISO'nun otomatik oluşturulup oluşturulmayacağı (varsayılan: açık)."""
+    try:
+        return bool(SettingsService.load().get("uup_iso", {}).get("auto_create_iso", True))
+    except Exception:
+        return True

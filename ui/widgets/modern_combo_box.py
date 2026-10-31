@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QSize, Qt
+
+from app import i18n
+from ui import styles
 from PySide6.QtGui import (
     QColor,
     QKeyEvent,
@@ -13,6 +16,9 @@ from PySide6.QtWidgets import (
     QComboBox,
     QListWidget,
     QListWidgetItem,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
     QVBoxLayout,
     QWidget,
 )
@@ -57,7 +63,7 @@ class RoundedComboPopup(QWidget):
         # The popup is a separate top-level window, so it does not inherit the
         # MainWindow stylesheet on Windows. Keep the theme here to guarantee
         # identical hover/selection colors everywhere ModernComboBox is used.
-        self.list_widget.setStyleSheet("""
+        self.list_widget.setStyleSheet(styles.qss("""
             QListWidget#modernComboPopupList {
                 background: transparent;
                 border: none;
@@ -79,7 +85,7 @@ class RoundedComboPopup(QWidget):
                 color: #0B1736;
             }
             QListWidget#modernComboPopupList::item:selected {
-                background: #2167D5;
+                background: @BLUE@;
                 color: #FFFFFF;
             }
             QListWidget#modernComboPopupList::item:selected:hover {
@@ -106,7 +112,7 @@ class RoundedComboPopup(QWidget):
                 background: transparent;
                 border: none;
             }
-        """)
+        """))
         self.list_widget.itemEntered.connect(self._on_item_hovered)
         layout.addWidget(self.list_widget)
 
@@ -147,7 +153,17 @@ class ModernComboBox(QComboBox):
         # QSS'deki native down-arrow bazı Windows/PySide6 kombinasyonlarında
         # görünmeyebiliyor. Kutunun açılır menü olduğu her zaman belli olsun diye
         # oku kendimiz çiziyoruz.
-        super().paintEvent(event)
+        if i18n.is_english():
+            # Kapalı kutudaki metni, mantıkta kullanılan değeri değiştirmeden çevirerek çiz.
+            sp = QStylePainter(self)
+            opt = QStyleOptionComboBox()
+            self.initStyleOption(opt)
+            opt.currentText = i18n.tr(opt.currentText)
+            sp.drawComplexControl(QStyle.CC_ComboBox, opt)
+            sp.drawControl(QStyle.CE_ComboBoxLabel, opt)
+            sp.end()
+        else:
+            super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         pen = QPen(QColor("#53657D"), 1.8)
@@ -209,7 +225,7 @@ class ModernComboBox(QComboBox):
 
         row_height = 38
         for row in range(self.count()):
-            item = QListWidgetItem(self.itemText(row))
+            item = QListWidgetItem(i18n.tr(self.itemText(row)))
             item.setData(Qt.UserRole, row)
             item.setSizeHint(QSize(max(self.width() - 18, 120), row_height))
             list_widget.addItem(item)

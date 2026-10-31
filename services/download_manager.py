@@ -9,6 +9,7 @@ import logging
 from PySide6.QtCore import QObject, QThread, Signal, QTimer
 
 from workers.download_worker import DownloadWorker
+from services.windows_update_service import WindowsUpdateService
 from app.paths import DOWNLOAD_STATE_PATH
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,11 @@ class DownloadJob:
     batch_id: str = ""
     batch_kind: str = ""
     batch_meta: dict = field(default_factory=dict)
+    verification_status: str = "Bekleniyor"
+    sha256: str = ""
+    signature: str = ""
+    verification_message: str = ""
+    source: str = ""
 
 
 class DownloadManager(QObject):
@@ -46,6 +52,7 @@ class DownloadManager(QObject):
     job_updated = Signal(str)
     request_open_manager = Signal()
     batch_completed = Signal(str, object)
+    job_schedule_changed = Signal()
 
     _instance = None
 
@@ -65,6 +72,13 @@ class DownloadManager(QObject):
         # Global queue control used by the IDM-style toolbar.  While paused,
         # active workers stay suspended and _pump_queue never starts a new job.
         self._global_paused = False
+        self._shutting_down = False
+        self._schedule_enabled = False
+        self._schedule_start = 1 * 60
+        self._schedule_end = 7 * 60
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.setInterval(30000)
+        self._schedule_timer.timeout.connect(self._pump_queue)
         self._state_file = DOWNLOAD_STATE_PATH
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -128,6 +142,11 @@ class DownloadManager(QObject):
                 item.setdefault("batch_id", "")
                 item.setdefault("batch_kind", "")
                 item.setdefault("batch_meta", {})
+                item.setdefault("verification_status", "Bekleniyor")
+                item.setdefault("sha256", "")
+                item.setdefault("signature", "")
+                item.setdefault("verification_message", "")
+                item.setdefault("source", "")
                 job = DownloadJob(**item)
             self.jobs[job.id] = job
 
@@ -272,6 +291,9 @@ class DownloadManager(QObject):
 
     def add_download(self, package, target_path: str) -> str:
         job_id = uuid.uuid4().hex
+        precheck = None
+        if str(getattr(package, "source", "")) == "Microsoft Update Catalog":
+            precheck = WindowsUpdateService.pre_download_check(package, WindowsUpdateService.snapshot())
         job = DownloadJob(
             id=job_id,
             filename=package.filename,
@@ -279,9 +301,15 @@ class DownloadManager(QObject):
             target_path=target_path,
             architecture=getattr(package, "architecture", ""),
             size_label=getattr(package, "size", "—"),
+            source=getattr(package, "source", ""),
         )
+        if precheck is False:
+            job.status = "Hata"
+            job.error = "İndirme ön kontrolü başarısız: HTTPS/Microsoft kaynağı, mimari veya paket rolü uygun değil."
+            job.verification_status = "Ön kontrol başarısız"
+        else:
+            self._queue.append(job_id)
         self.jobs[job_id] = job
-        self._queue.append(job_id)
         self._save_state()
         self.job_added.emit(job_id)
         self.job_updated.emit(job_id)
@@ -298,6 +326,9 @@ class DownloadManager(QObject):
         batch_id = uuid.uuid4().hex if batch_meta else ""
         for package, target_path in items:
             job_id = uuid.uuid4().hex
+            precheck = None
+            if str(getattr(package, "source", "")) == "Microsoft Update Catalog":
+                precheck = WindowsUpdateService.pre_download_check(package, WindowsUpdateService.snapshot())
             job = DownloadJob(
                 id=job_id,
                 filename=package.filename,
@@ -305,12 +336,18 @@ class DownloadManager(QObject):
                 target_path=target_path,
                 architecture=getattr(package, "architecture", ""),
                 size_label=getattr(package, "size", "—"),
+                source=getattr(package, "source", ""),
                 batch_id=batch_id,
                 batch_kind=batch_kind,
                 batch_meta=batch_meta,
             )
+            if precheck is False:
+                job.status = "Hata"
+                job.error = "İndirme ön kontrolü başarısız: HTTPS/Microsoft kaynağı, mimari veya paket rolü uygun değil."
+                job.verification_status = "Ön kontrol başarısız"
+            else:
+                self._queue.append(job_id)
             self.jobs[job_id] = job
-            self._queue.append(job_id)
             ids.append(job_id)
             self.job_added.emit(job_id)
             self.job_updated.emit(job_id)
@@ -320,8 +357,90 @@ class DownloadManager(QObject):
             self.request_open_manager.emit()
         return ids
 
+    # ── Hız sınırı ve zamanlama (ayarlardan) ──
+    def apply_settings(self, downloads: dict) -> None:
+        """Ayarlar > İndirme: eşzamanlı sayı, hız sınırı ve gece zamanlaması."""
+        downloads = downloads or {}
+        self.set_max_concurrent(downloads.get("max_concurrent", self.max_concurrent))
+        try:
+            kbps = int(downloads.get("speed_limit_kbps", 0) or 0)
+        except (TypeError, ValueError):
+            kbps = 0
+        DownloadWorker.speed_limit_bps = max(0, kbps) * 1024
+        self._schedule_enabled = bool(downloads.get("schedule_enabled", False))
+        self._schedule_start = self._parse_clock(downloads.get("schedule_start"), 1 * 60)
+        self._schedule_end = self._parse_clock(downloads.get("schedule_end"), 7 * 60)
+        if self._schedule_enabled and not self._schedule_timer.isActive():
+            self._schedule_timer.start()
+        elif not self._schedule_enabled:
+            self._schedule_timer.stop()
+        self._pump_queue()
+        self.job_schedule_changed.emit()
+
+    @staticmethod
+    def _parse_clock(value, default_minutes: int) -> int:
+        try:
+            hours, minutes = str(value).split(":", 1)
+            return max(0, min(23, int(hours))) * 60 + max(0, min(59, int(minutes)))
+        except Exception:
+            return default_minutes
+
+    def schedule_open(self, now=None) -> bool:
+        """Zamanlama kapalıysa ya da şu an izin verilen aralıktaysa True."""
+        if not self._schedule_enabled:
+            return True
+        if now is None:
+            from datetime import datetime
+            now = datetime.now()
+        current = now.hour * 60 + now.minute
+        start, end = self._schedule_start, self._schedule_end
+        if start == end:
+            return True
+        if start < end:
+            return start <= current < end
+        return current >= start or current < end  # gece yarısını aşan aralık
+
+    def schedule_text(self) -> str:
+        if not self._schedule_enabled:
+            return ""
+        window = f"{self._schedule_start // 60:02d}:{self._schedule_start % 60:02d}–{self._schedule_end // 60:02d}:{self._schedule_end % 60:02d}"
+        if self.schedule_open():
+            return f"Zamanlama açık ({window})."
+        return f"Zamanlı indirme: yeni indirmeler yalnızca {window} arasında başlar."
+
+    def shutdown(self, timeout_ms: int = 2500) -> None:
+        """Program kapanırken çalışan indirmeleri güvenle durdurur (yarım dosyalar sonra devam eder)."""
+        self._shutting_down = True
+        self._schedule_timer.stop()
+        for worker in list(self._workers.values()):
+            try:
+                worker.stop_silently()
+            except RuntimeError:
+                pass
+        for thread in list(self._threads.values()):
+            try:
+                thread.quit()
+                if not thread.wait(timeout_ms):
+                    logger.warning("İndirme iş parçacığı zamanında durmadı; süreç sonlanırken bırakılacak.")
+            except RuntimeError:
+                pass
+        for job in self.jobs.values():
+            part = self._part_path_for(job)
+            if job.status in self.RUNNING_STATUSES and part.exists():
+                try:
+                    job.downloaded = part.stat().st_size
+                except OSError:
+                    pass
+            job.speed = 0
+        self._state_dirty = True
+        self._flush_state()
+
     def _pump_queue(self):
-        if self._global_paused:
+        if self._global_paused or getattr(self, "_shutting_down", False):
+            return
+        DownloadWorker.active_count = max(1, len(self._threads))
+        if not self.schedule_open():
+            self._save_state()
             return
         while len(self._threads) < self.max_concurrent and self._queue:
             job_id = self._queue.pop(0)
@@ -356,6 +475,7 @@ class DownloadManager(QObject):
             job.status = "Başlatılıyor"
         self.job_updated.emit(job_id)
         self._save_state()
+        DownloadWorker.active_count = max(1, len(self._threads))
         thread.start()
 
     @property
@@ -527,15 +647,48 @@ class DownloadManager(QObject):
 
     def _on_finished(self, job_id, path):
         job = self.jobs.get(job_id)
-        if job:
-            job.status = "Tamamlandı"
-            job.target_path = path
-            job.speed = 0
-            job.eta = 0
-            job.retry_count = 0
+        if not job:
+            return
+        job.target_path = path
+        job.speed = 0
+        job.eta = 0
+        job.verification_status = "Doğrulanıyor"
+        self.job_updated.emit(job_id)
+        self._save_state(immediate=True)
+        try:
+            result = WindowsUpdateService.verify_file(path)
+            job.sha256 = result.get("sha256", "")
+            job.signature = result.get("signature", "")
+            job.verification_message = result.get("message", "")
+            if result.get("valid"):
+                job.verification_status = "Doğrulandı"
+                job.status = "Tamamlandı"
+                job.retry_count = 0
+                self.job_updated.emit(job_id)
+                self._save_state()
+                self._check_batch_complete(job.batch_id)
+            else:
+                job.verification_status = "BAŞARISIZ"
+                job.error = "İndirme tamamlandı ancak güvenlik doğrulaması başarısız: " + (result.get("message") or "bilinmeyen hata")
+                job.status = "Hata"
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self.job_updated.emit(job_id)
+                self._save_state()
+                if job.retry_count < job.max_retries:
+                    job.retry_count += 1
+                    job.status = f"Doğrulama başarısız — yeniden indiriliyor ({job.retry_count}/{job.max_retries})"
+                    self.job_updated.emit(job_id)
+                    self._save_state()
+                    QTimer.singleShot(min(15000, 1500 * job.retry_count), lambda jid=job_id: self._enqueue_automatic_retry(jid))
+        except Exception as exc:
+            job.verification_status = "Kontrol hatası"
+            job.error = "İndirme sonrası doğrulama çalıştırılamadı: " + str(exc)
+            job.status = "Hata"
             self.job_updated.emit(job_id)
             self._save_state()
-            self._check_batch_complete(job.batch_id)
 
     def _on_failed(self, job_id, message):
         job = self.jobs.get(job_id)

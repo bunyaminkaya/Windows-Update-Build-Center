@@ -18,6 +18,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 LOG_PATH = LOG_DIR / "app.log"
 DOWNLOAD_STATE_PATH = DATA_DIR / "download_state.json"
 ISO_TASKS_PATH = DATA_DIR / "iso_tasks.json"
+BUILD_HISTORY_PATH = DATA_DIR / "build_tracker_history.json"
 
 LEGACY_PROJECT_DATA_DIR = ROOT / "data"
 LEGACY_PROJECT_LOG_DIR = ROOT / "logs"
@@ -45,6 +46,7 @@ def migrate_legacy_user_data() -> None:
         "build_tracker_cache.json",
         "windows_build_tracker_cache.json",
         "official_build_cache.json",
+        "build_tracker_history.json",
     ):
         _copy_if_missing(LEGACY_PROJECT_DATA_DIR / name, DATA_DIR / name)
 

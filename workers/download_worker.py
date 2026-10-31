@@ -10,6 +10,10 @@ from PySide6.QtCore import QObject, Signal
 
 
 class DownloadWorker(QObject):
+    # Tüm indirmeler için ortak hız sınırı (bayt/sn, 0 = sınırsız). DownloadManager ayarlar.
+    speed_limit_bps: int = 0
+    active_count: int = 1
+
     progress = Signal(str, int, int, float, float)
     status = Signal(str, str)
     finished = Signal(str, str)
@@ -25,6 +29,14 @@ class DownloadWorker(QObject):
         self._pause_event = threading.Event()
         self._pause_event.set()
         self._cancel_event = threading.Event()
+        self._silent_stop = False  # program kapanırken: .part dosyası ve durum korunur, sinyal gönderilmez
+
+    @staticmethod
+    def _current_share() -> int:
+        limit = int(DownloadWorker.speed_limit_bps or 0)
+        if limit <= 0:
+            return 0
+        return max(16 * 1024, limit // max(1, int(DownloadWorker.active_count or 1)))
 
     def pause(self):
         self._pause_event.clear()
@@ -35,6 +47,12 @@ class DownloadWorker(QObject):
         self.status.emit(self.job_id, "İndiriliyor")
 
     def cancel(self):
+        self._cancel_event.set()
+        self._pause_event.set()
+
+    def stop_silently(self):
+        """Program kapanırken çağrılır: indirme durur, yarım dosya sonra devam etmek için saklanır."""
+        self._silent_stop = True
         self._cancel_event.set()
         self._pause_event.set()
 
@@ -77,14 +95,21 @@ class DownloadWorker(QObject):
                 self.status.emit(self.job_id, "İndiriliyor")
 
                 with open(self.part_path, mode) as file:
-                    for chunk in response.iter_content(chunk_size=512 * 1024):
+                    throttle_t0 = time.monotonic()
+                    throttle_bytes = 0
+                    throttle_share = 0
+                    limited_at_start = DownloadWorker.speed_limit_bps > 0
+                    # Hız sınırı varken küçük parçalarla oku ki sınır düzgün uygulansın.
+                    for chunk in response.iter_content(chunk_size=(64 if limited_at_start else 512) * 1024):
                         if self._cancel_event.is_set():
-                            self.cancelled.emit(self.job_id)
+                            if not self._silent_stop:
+                                self.cancelled.emit(self.job_id)
                             return
 
                         self._pause_event.wait()
                         if self._cancel_event.is_set():
-                            self.cancelled.emit(self.job_id)
+                            if not self._silent_stop:
+                                self.cancelled.emit(self.job_id)
                             return
 
                         if not chunk:
@@ -92,6 +117,19 @@ class DownloadWorker(QObject):
 
                         file.write(chunk)
                         downloaded += len(chunk)
+                        share = self._current_share()
+                        if share > 0:
+                            if share != throttle_share:  # sınır değişti: ölçümü sıfırla
+                                throttle_share = share
+                                throttle_t0 = time.monotonic()
+                                throttle_bytes = 0
+                            throttle_bytes += len(chunk)
+                            wait = throttle_bytes / share - (time.monotonic() - throttle_t0)
+                            while wait > 0 and not self._cancel_event.is_set():
+                                time.sleep(min(wait, 0.2))
+                                wait -= 0.2
+                        else:
+                            throttle_share = 0
                         now = time.monotonic()
                         elapsed = max(now - last_time, 0.001)
                         instant_speed = (downloaded - last_bytes) / elapsed

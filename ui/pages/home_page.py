@@ -2,19 +2,23 @@ from pathlib import Path
 import re
 import json
 import webbrowser
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread, Qt, Signal, QEvent, QSize, QRectF
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton,  QFrame, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSplitter, QSizePolicy, QListWidget, QListWidgetItem, QApplication, QScrollArea, QFileDialog, QCompleter, QDialog
+    QHeaderView, QSplitter, QSizePolicy, QListWidget, QListWidgetItem, QApplication, QScrollArea, QFileDialog, QCompleter,
+    QStackedWidget, QStyledItemDelegate, QStyle
 )
 
 from database.connection import get_connection
 from workers.catalog_search_worker import CatalogSearchWorker
 from workers.package_lookup_worker import PackageLookupWorker
 from services.download_manager import DownloadManager
+from services.iso_version_service import parse_version_query
 from services.system_profile import SystemProfileService
 from services.settings_service import SettingsService
+from ui import icons, styles
 from ui.widgets.message_dialog import show_message, show_information, show_warning, show_error
 from ui.widgets.modern_combo_box import ModernComboBox
 
@@ -40,7 +44,90 @@ class StatCard(QFrame):
         layout.addWidget(self.note_label)
 
 
+class CompletionDelegate(QStyledItemDelegate):
+    """Öneri listesinde yazılan kısmı soluk, tamamlayıcı kısmı kalın gösterir."""
+
+    def __init__(self, line_edit, parent=None):
+        super().__init__(parent)
+        self._edit = line_edit
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), 38)
+
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(option.rect).adjusted(6, 2, -6, -2)
+        selected = bool(option.state & (QStyle.State_Selected | QStyle.State_MouseOver))
+        if selected:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#E8F1FE"))
+            painter.drawRoundedRect(rect, 8, 8)
+
+        text = str(index.data(Qt.DisplayRole) or "")
+        typed = self._edit.text()
+        font = QFont(option.font)
+        font.setPixelSize(15)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        x = rect.left() + 12
+        y_rect = QRectF(x, rect.top(), rect.width() - 24, rect.height())
+
+        n = len(typed)
+        if n and text.casefold().startswith(typed.casefold()):
+            head, tail = text[:n], text[n:]
+            painter.setPen(QColor("#6B7C97"))
+            painter.drawText(y_rect, Qt.AlignVCenter | Qt.AlignLeft, head)
+            x += metrics.horizontalAdvance(head)
+            bold = QFont(font)
+            bold.setWeight(QFont.Bold)
+            painter.setFont(bold)
+            painter.setPen(QColor("#0F2347"))
+            painter.drawText(QRectF(x, rect.top(), rect.right() - x - 12, rect.height()),
+                             Qt.AlignVCenter | Qt.AlignLeft, tail)
+        else:
+            painter.setPen(QColor("#0F2347"))
+            painter.drawText(y_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+        painter.restore()
+
+
+class AutoHideButton(QPushButton):
+    """Etkin değilken görünmez olan düğme (yalnızca arayüz davranışı)."""
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.EnabledChange:
+            self.setVisible(self.isEnabled())
+        super().changeEvent(event)
+
+
+class ClickableCard(QFrame):
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+def _pix_label(name, color="#FFFFFF", size=20, bg="#FFFFFF", stroke=1.9):
+    label = QLabel()
+    label.setPixmap(icons.pixmap(name, color, size, bg=bg, stroke=stroke))
+    label.setFixedSize(size, size)
+    label.setAttribute(Qt.WA_TranslucentBackground, True)
+    return label
+
+
 class HomePage(QWidget):
+    # Arama başarıyla tamamlandığında sol menüdeki "Son kontrol" bilgisini
+    # güncellemek için kullanılır (yalnızca arayüz bildirimi).
+    search_completed = Signal()
+
+    BLUE = "#1F6FEB"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._thread = None
@@ -51,43 +138,129 @@ class HomePage(QWidget):
         self._package_thread = None
         self._package_worker = None
         self._packages = []
+        self._wide_cols = None
+        self._wide_filters = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 24)
-        layout.setSpacing(16)
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
 
-        subtitle = QLabel("KB numarası veya Windows build numarasıyla resmi Microsoft güncellemelerini bulun, filtreleyin ve doğrudan indirin.")
-        subtitle.setObjectName("pageSubtitle")
-        layout.addWidget(subtitle)
+        self._scroll = QScrollArea()
+        self._scroll.setObjectName("muScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("muContent")
+        self._scroll.setWidget(content)
+        page_layout.addWidget(self._scroll)
 
-        search_card = QFrame()
-        search_card.setObjectName("searchCard")
-        s = QVBoxLayout(search_card)
-        s.setContentsMargins(16, 16, 16, 16)
-        s.setSpacing(12)
+        root = QVBoxLayout(content)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(18)
 
+        root.addLayout(self._build_header())
+        root.addLayout(self._build_search_row())
+
+        self._cols = QGridLayout()
+        self._cols.setHorizontalSpacing(18)
+        self._cols.setVerticalSpacing(18)
+        self._left_col = QWidget()
+        left = QVBoxLayout(self._left_col)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(18)
+        left.addWidget(self._build_results_card())
+        left.addWidget(self._build_selected_card())
+        left.addStretch(1)
+
+        self._right_col = QWidget()
+        self._right_col.setFixedWidth(306)
+        right = QVBoxLayout(self._right_col)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(18)
+        right.addWidget(self._build_about_card())
+        right.addWidget(self._build_quick_card())
+        right.addStretch(1)
+
+        self._cols.setColumnStretch(0, 1)
+        root.addLayout(self._cols)
+        root.addStretch(1)
+
+        self._build_hidden_legacy_widgets()
+        self._wire_dynamic_visibility()
+        self._apply_page_styles()
+        self._refresh_mockup_fields(None)
+        self._sync_package_area()
+        self._on_results_changed()
+        self._relayout_responsive()
+
+    # ------------------------------------------------------------------
+    # Arayüz kurulumu (yalnızca görünüm)
+    # ------------------------------------------------------------------
+    def _build_header(self):
+        head = QHBoxLayout()
+        head.setSpacing(16)
+        logo = QLabel()
+        logo.setPixmap(icons.pixmap("windows", size=52))
+        logo.setFixedSize(52, 52)
+        head.addWidget(logo, 0, Qt.AlignTop)
+
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        title = QLabel("Güncelleme Merkezi")
+        title.setObjectName("muTitle")
+        subtitle = QLabel(
+            "Windows güncellemelerini ve build'leri arayın, "
+            "resmi ISO veya UUP paketlerine ulaşın."
+        )
+        subtitle.setObjectName("muSubtitle")
+        subtitle.setWordWrap(True)
+        box.addWidget(title)
+        box.addWidget(subtitle)
+        head.addLayout(box, 1)
+        return head
+
+    def _build_search_row(self):
         top = QHBoxLayout()
+        top.setSpacing(12)
+
         self.search_input = QLineEdit()
+        self.search_input.setObjectName("muSearch")
         self.search_input.setPlaceholderText("KB5101650 veya 26200.8875 gibi bir değer girin...")
+        self.search_input.setMinimumHeight(52)
         self.search_input.returnPressed.connect(self.start_search)
+        self._clear_action = self.search_input.addAction(
+            icons.icon("x", "#5C6B82", 16, stroke=2.2), QLineEdit.TrailingPosition
+        )
+        self._clear_action.setVisible(False)
+        self._clear_action.triggered.connect(self.search_input.clear)
+        self.search_input.textChanged.connect(
+            lambda text: self._clear_action.setVisible(bool(text))
+        )
         self._refresh_search_completer()
 
-        self.search_button = QPushButton("Ara")
+        self.search_button = QPushButton("  Ara")
+        self.search_button.setObjectName("muSearchBtn")
+        self.search_button.setIcon(icons.icon("search", "#FFFFFF", 20, stroke=2.2))
+        self.search_button.setIconSize(QSize(20, 20))
+        self.search_button.setCursor(Qt.PointingHandCursor)
+        self.search_button.setFixedHeight(52)
+        self.search_button.setMinimumWidth(122)
         self.search_button.clicked.connect(self.start_search)
 
-        self.stop_button = QPushButton("Aramayı Durdur")
+        self.stop_button = AutoHideButton("Aramayı Durdur")
         self.stop_button.setObjectName("dangerButton")
+        self.stop_button.setFixedHeight(52)
+        self.stop_button.setCursor(Qt.PointingHandCursor)
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_search)
 
         top.addWidget(self.search_input, 1)
         top.addWidget(self.search_button)
         top.addWidget(self.stop_button)
-        s.addLayout(top)
+        return top
 
-        filters = QHBoxLayout()
-        filters.setSpacing(10)
-
+    def _make_filters(self):
         # Filtre kutularında yalnızca "Tümü" yazmak kullanıcıya neyi seçtiğini
         # anlatmıyordu. Her kutu artık kendi amacını doğrudan seçili metinde gösterir.
         self.source_filter = ModernComboBox()
@@ -122,8 +295,11 @@ class HomePage(QWidget):
             "Tüm mimarileri görmek için Tümü seçeneğini kullanabilirsiniz."
         )
         self.language_filter = ModernComboBox()
-        self.language_filter.addItems(["Dil: Tümü"])
-        self.language_filter.setToolTip("Paket dili filtresi. Catalog sonucu dil bilgisi sağladığında seçenekler otomatik genişletilebilir.")
+        self.language_filter.addItems(["Dil: Tümü"] + [f"Dil: {name}" for name in SystemProfileService.language_options()])
+        self.language_filter.setToolTip(
+            "26H2 / 25H2 gibi sürüm adıyla ISO ararken ISO Merkezi'nde seçili gelecek dil. "
+            "Tümü seçiliyse sistem dili kullanılır. Güncelleme (KB/build) aramalarını etkilemez."
+        )
 
         self.version_filter = ModernComboBox()
         self.version_filter.addItems([
@@ -134,34 +310,70 @@ class HomePage(QWidget):
             "Windows Sürümü: 26H2",
         ])
         self.version_filter.setToolTip("Windows sürümünü / özellik güncellemesi dalını filtreler.")
-        for combo in [self.source_filter, self.type_filter, self.arch_filter, self.language_filter, self.version_filter]:
+
+        box = QWidget()
+        self._filters_grid = QGridLayout(box)
+        self._filters_grid.setContentsMargins(0, 0, 0, 0)
+        self._filters_grid.setHorizontalSpacing(10)
+        self._filters_grid.setVerticalSpacing(10)
+        self._filter_combos = [
+            self.source_filter, self.type_filter, self.arch_filter,
+            self.language_filter, self.version_filter,
+        ]
+        for combo in self._filter_combos:
+            combo.setMinimumHeight(40)
+            combo.setMaximumHeight(40)
+            combo.setMinimumContentsLength(6)
+            combo.setSizeAdjustPolicy(ModernComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumWidth(110)
+            combo.setMaximumWidth(210)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             combo.currentIndexChanged.connect(self.apply_filters)
-            filters.addWidget(combo)
-        s.addLayout(filters)
-        layout.addWidget(search_card)
+        return box
 
-        stats = QGridLayout()
-        self.last_search_card = StatCard("Son Arama", "—", "Henüz arama yapılmadı")
-        self.count_card = StatCard("Bulunan Kayıt", "0", "Catalog sonuçları")
-        self.match_card = StatCard("Arama Türü", "Hazır", "KB veya build bekleniyor")
-        self.status_card = StatCard("Durum", "Hazır", "Aramaya hazır")
-        stats.addWidget(self.last_search_card, 0, 0)
-        stats.addWidget(self.count_card, 0, 1)
-        stats.addWidget(self.match_card, 0, 2)
-        stats.addWidget(self.status_card, 0, 3)
-        layout.addLayout(stats)
+    def _arrange_filters(self, one_row: bool):
+        grid = self._filters_grid
+        for combo in self._filter_combos:
+            grid.removeWidget(combo)
+        for col in range(5):
+            grid.setColumnStretch(col, 0)
+        columns = 5 if one_row else 3
+        for index, combo in enumerate(self._filter_combos):
+            combo.setMaximumWidth(210 if one_row else 16777215)
+            grid.addWidget(combo, index // columns, index % columns)
+        for col in range(columns):
+            grid.setColumnStretch(col, 1)
 
-        self.status_label = QLabel("Hazır. KB veya build numarası girerek arama yapabilirsiniz.")
-        self.status_label.setObjectName("infoBox")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+    def _build_results_card(self):
+        card = QFrame()
+        card.setObjectName("muCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
-        self.explainer_label = QLabel("Burada bulunan sonuçlar, Microsoft Update Catalog'un döndürdüğü resmi kayıtlardır.")
-        self.explainer_label.setObjectName("subtleInfoBox")
-        self.explainer_label.setWordWrap(True)
-        layout.addWidget(self.explainer_label)
+        header = QWidget()
+        header.setObjectName("muCardHeader")
+        self._results_header = QGridLayout(header)
+        self._results_header.setContentsMargins(20, 14, 20, 14)
+        self._results_header.setHorizontalSpacing(14)
+        self._results_header.setVerticalSpacing(12)
 
-        self.results_table = QTableWidget(0, 9)
+        title_box = QWidget()
+        tb = QHBoxLayout(title_box)
+        tb.setContentsMargins(0, 0, 0, 0)
+        tb.setSpacing(10)
+        tb.addWidget(_pix_label("user", "#1F4FA3", 22, stroke=1.9))
+        self.results_title = QLabel("Arama Sonuçları (0)")
+        self.results_title.setObjectName("muCardTitle")
+        tb.addWidget(self.results_title)
+        tb.addStretch(1)
+        self._results_title_box = title_box
+        self._filters_box = self._make_filters()
+        v.addWidget(header)
+
+        # Sonuç tablosu
+        self.results_table = QTableWidget(0, 10)
+        self.results_table.setObjectName("muTable")
         self.results_table.setHorizontalHeaderLabels([
             "Başlık",
             "Sürüm / Build",
@@ -172,6 +384,7 @@ class HomePage(QWidget):
             "Sınıflandırma",
             "Ürün",
             "Kaynak",
+            "",
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -179,28 +392,40 @@ class HomePage(QWidget):
         self.results_table.setSelectionMode(QTableWidget.SingleSelection)
         self.results_table.setShowGrid(False)
         self.results_table.setFocusPolicy(Qt.NoFocus)
-        self.results_table.setWordWrap(False)
+        self.results_table.setWordWrap(True)
+        self.results_table.setFrameShape(QFrame.NoFrame)
+        self.results_table.setIconSize(QSize(26, 26))
         self.results_table.verticalHeader().setVisible(False)
-        self.results_table.verticalHeader().setDefaultSectionSize(34)
-        header = self.results_table.horizontalHeader()
-        header.setStretchLastSection(False)
+        self.results_table.verticalHeader().setDefaultSectionSize(58)
+        header_view = self.results_table.horizontalHeader()
+        header_view.setStretchLastSection(False)
+        header_view.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_view.setFixedHeight(40)
+        header_view.setHighlightSections(False)
 
         # Öncelikli sütunlar daha geniş ve görünür tutulur.
-        header.setSectionResizeMode(0, QHeaderView.Stretch)           # Başlık
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents) # Sürüm / Build
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents) # KB
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents) # Mimari
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents) # Boyut
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents) # Tarih
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents) # Sınıflandırma
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents) # Ürün
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents) # Kaynak
+        header_view.setSectionResizeMode(0, QHeaderView.Stretch)           # Başlık
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeToContents) # Sürüm / Build
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeToContents) # KB
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeToContents) # Mimari
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeToContents) # Boyut
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeToContents) # Tarih
+        header_view.setSectionResizeMode(6, QHeaderView.ResizeToContents) # Sınıflandırma
+        header_view.setSectionResizeMode(7, QHeaderView.ResizeToContents) # Ürün
+        header_view.setSectionResizeMode(8, QHeaderView.ResizeToContents) # Kaynak
+        header_view.setSectionResizeMode(9, QHeaderView.Fixed)             # Ok
+        self.results_table.setColumnWidth(9, 46)
+
+        # Sınıflandırma / Ürün / Kaynak bilgisi tabloda tutulur ancak görsel
+        # tasarımda seçili kayıt kartındaki etiketlerde gösterilir.
+        for hidden_col in (6, 7, 8):
+            self.results_table.setColumnHidden(hidden_col, True)
 
         self.results_table.setColumnWidth(1, 120)
-        self.results_table.setColumnWidth(2, 100)
-        self.results_table.setColumnWidth(3, 85)
-        self.results_table.setColumnWidth(4, 100)
-        self.results_table.setColumnWidth(5, 100)
+        self.results_table.setColumnWidth(2, 110)
+        self.results_table.setColumnWidth(3, 90)
+        self.results_table.setColumnWidth(4, 110)
+        self.results_table.setColumnWidth(5, 110)
 
         self.results_table.itemSelectionChanged.connect(
             self._on_selection_changed
@@ -209,141 +434,218 @@ class HomePage(QWidget):
             self._on_result_double_clicked
         )
 
-        self.detail_panel = QFrame()
-        self.detail_panel.setObjectName("detailPanel")
-        self.detail_panel.setMinimumWidth(430)
-        self.detail_panel.setMaximumWidth(620)
+        # Boş durum: durum + açıklama metinleri tablo yerine gösterilir.
+        self.status_label = QLabel("Hazır. KB veya build numarası girerek arama yapabilirsiniz.")
+        self.status_label.setObjectName("muEmptyStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.setAlignment(Qt.AlignCenter)
 
-        detail_outer_layout = QVBoxLayout(self.detail_panel)
-        detail_outer_layout.setContentsMargins(0, 0, 0, 0)
-        detail_outer_layout.setSpacing(0)
+        self.explainer_label = QLabel("Burada bulunan sonuçlar, Microsoft Update Catalog'un döndürdüğü resmi kayıtlardır.")
+        self.explainer_label.setObjectName("muEmptyHint")
+        self.explainer_label.setWordWrap(True)
+        self.explainer_label.setAlignment(Qt.AlignCenter)
 
-        # Scrollable content prevents labels and package cards from being
-        # compressed when Windows scaling or window height changes.
-        self.detail_scroll = QScrollArea()
-        self.detail_scroll.setObjectName("detailScroll")
-        self.detail_scroll.setWidgetResizable(True)
-        self.detail_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarAlwaysOff
-        )
-        self.detail_scroll.setFrameShape(QFrame.NoFrame)
+        empty_page = QWidget()
+        ev = QVBoxLayout(empty_page)
+        ev.setContentsMargins(40, 20, 40, 20)
+        ev.setSpacing(8)
+        ev.addStretch(1)
+        empty_icon = QLabel()
+        empty_icon.setPixmap(icons.pixmap("search", "#B5C4DA", 38, stroke=1.6))
+        empty_icon.setAlignment(Qt.AlignCenter)
+        ev.addWidget(empty_icon)
+        ev.addWidget(self.status_label)
+        ev.addWidget(self.explainer_label)
+        ev.addStretch(1)
 
-        detail_content = QWidget()
-        detail_content.setObjectName("detailScrollContent")
-        detail_layout = QVBoxLayout(detail_content)
-        detail_layout.setContentsMargins(18, 18, 18, 16)
-        detail_layout.setSpacing(10)
+        self._results_stack = QStackedWidget()
+        self._results_stack.setObjectName("muResultsStack")
+        self._results_stack.addWidget(empty_page)
+        self._results_stack.addWidget(self.results_table)
+        self._results_stack.setFixedHeight(340)
+        v.addWidget(self._results_stack)
+        return card
 
-        detail_title = QLabel("Seçili Kayıt")
-        detail_title.setObjectName("detailTitle")
-        detail_layout.addWidget(detail_title)
+    def _meta_tile(self, icon_name, caption, value_label):
+        card = QFrame()
+        card.setObjectName("muMetaCard")
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(14)
+        tile = QLabel()
+        tile.setObjectName("muMetaIcon")
+        tile.setFixedSize(42, 42)
+        tile.setAlignment(Qt.AlignCenter)
+        tile.setPixmap(icons.pixmap(icon_name, self.BLUE, 22, stroke=1.9))
+        box = QVBoxLayout()
+        box.setSpacing(2)
+        cap = QLabel(caption)
+        cap.setObjectName("muMetaCaption")
+        value_label.setObjectName("muMetaValue")
+        value_label.setWordWrap(True)
+        box.addWidget(cap)
+        box.addWidget(value_label)
+        lay.addWidget(tile, 0, Qt.AlignVCenter)
+        lay.addLayout(box, 1)
+        return card
+
+    def _build_selected_card(self):
+        card = QFrame()
+        card.setObjectName("muCard")
+        self.detail_panel = card
+        v = QVBoxLayout(card)
+        v.setContentsMargins(24, 22, 24, 22)
+        v.setSpacing(18)
+
+        # --- Üst bölüm: logo, başlık, etiketler, eylem düğmeleri
+        top = QHBoxLayout()
+        top.setSpacing(18)
+        logo_tile = QLabel()
+        logo_tile.setObjectName("muLogoTile")
+        logo_tile.setFixedSize(72, 72)
+        logo_tile.setAlignment(Qt.AlignCenter)
+        logo_tile.setPixmap(icons.pixmap("windows", size=46))
+        top.addWidget(logo_tile, 0, Qt.AlignTop)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(5)
+        self.result_badge = QLabel("Bulunan Sonuç")
+        self.result_badge.setObjectName("muBadge")
+        badge_row = QHBoxLayout()
+        badge_row.addWidget(self.result_badge)
+        badge_row.addStretch(1)
+        title_box.addLayout(badge_row)
 
         self.detail_name = QLabel(
             "Detayları görmek için listeden bir kayıt seçin."
         )
-        self.detail_name.setObjectName("detailName")
+        self.detail_name.setObjectName("muSelTitle")
         self.detail_name.setWordWrap(True)
-        self.detail_name.setSizePolicy(
-            QSizePolicy.Preferred,
-            QSizePolicy.Minimum,
-        )
-        detail_layout.addWidget(self.detail_name)
+        self.detail_name.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        title_box.addWidget(self.detail_name)
 
-        # Compact metadata cards use the empty horizontal space in the
-        # selected-record panel and keep package information higher on screen.
-        metadata_frame = QFrame()
-        metadata_frame.setObjectName("detailMetadataGrid")
-        metadata_grid = QGridLayout(metadata_frame)
-        metadata_grid.setContentsMargins(0, 0, 0, 0)
-        metadata_grid.setHorizontalSpacing(8)
-        metadata_grid.setVerticalSpacing(8)
+        self.build_line = QLabel("")
+        self.build_line.setObjectName("muSelBuild")
+        title_box.addWidget(self.build_line)
 
-        def create_meta_card(caption, value_label, row, column, column_span=1):
-            card = QFrame()
-            card.setObjectName("detailMetaCard")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(10, 7, 10, 7)
-            card_layout.setSpacing(1)
-
-            caption_label = QLabel(caption)
-            caption_label.setObjectName("detailMetaCaption")
-            value_label.setObjectName("detailMetaValue")
-            value_label.setWordWrap(True)
-            value_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-
-            card_layout.addWidget(caption_label)
-            card_layout.addWidget(value_label)
-            metadata_grid.addWidget(card, row, column, 1, column_span)
-
-        def create_dual_meta_card(caption_left, value_left, caption_right, value_right, row, column):
-            card = QFrame()
-            card.setObjectName("detailMetaCard")
-            card_layout = QHBoxLayout(card)
-            card_layout.setContentsMargins(10, 7, 10, 7)
-            card_layout.setSpacing(14)
-
-            left_layout = QVBoxLayout()
-            left_layout.setSpacing(1)
-            left_caption = QLabel(caption_left)
-            left_caption.setObjectName("detailMetaCaption")
-            value_left.setObjectName("detailMetaValue")
-            value_left.setWordWrap(False)
-            left_layout.addWidget(left_caption)
-            left_layout.addWidget(value_left)
-
-            right_layout = QVBoxLayout()
-            right_layout.setSpacing(1)
-            right_caption = QLabel(caption_right)
-            right_caption.setObjectName("detailMetaCaption")
-            value_right.setObjectName("detailMetaValue")
-            value_right.setWordWrap(False)
-            right_layout.addWidget(right_caption)
-            right_layout.addWidget(value_right)
-
-            card_layout.addLayout(left_layout, 1)
-            card_layout.addLayout(right_layout, 1)
-            metadata_grid.addWidget(card, row, column)
-
-        self.detail_version = QLabel("—")
         self.detail_kb = QLabel("—")
-        self.detail_arch = QLabel("—")
         self.detail_size = QLabel("—")
-        self.detail_date = QLabel("—")
-        self.detail_channel = QLabel("—")
         self.detail_classification = QLabel("—")
-        self.detail_source = QLabel("—")
         self.detail_product = QLabel("—")
+        self.detail_source = QLabel("—")
+        self._chips = [
+            self.detail_kb, self.detail_size, self.detail_classification,
+            self.detail_product, self.detail_source,
+        ]
+        chip_row = QHBoxLayout()
+        chip_row.setSpacing(8)
+        for chip in self._chips:
+            chip.setObjectName("muChip")
+            chip_row.addWidget(chip)
+        chip_row.addStretch(1)
+        top.addLayout(title_box, 1)
 
-        create_dual_meta_card("Sürüm / Build", self.detail_version, "KB", self.detail_kb, 0, 0)
-        create_dual_meta_card("Mimari", self.detail_arch, "Boyut", self.detail_size, 0, 1)
-        create_dual_meta_card("Yayın Tarihi", self.detail_date, "Kanal", self.detail_channel, 0, 2)
-        create_meta_card("Sınıflandırma", self.detail_classification, 1, 0, 2)
-        create_meta_card("Kaynak", self.detail_source, 1, 2)
-        create_meta_card("Ürün", self.detail_product, 2, 0, 3)
-
-        metadata_grid.setColumnStretch(0, 1)
-        metadata_grid.setColumnStretch(1, 1)
-        metadata_grid.setColumnStretch(2, 1)
-        detail_layout.addWidget(metadata_frame)
-
-        package_title = QLabel("İndirme Paketleri")
-        package_title.setObjectName("detailSectionTitle")
-        detail_layout.addWidget(package_title)
-
-        self.package_status = QLabel("Henüz paket aranmadı.")
-        self.package_status.setObjectName("detailMeta")
-        self.package_status.setWordWrap(True)
-        self.package_status.setSizePolicy(
-            QSizePolicy.Preferred,
-            QSizePolicy.Minimum,
+        actions = QVBoxLayout()
+        actions.setSpacing(8)
+        self.favorite_button = QPushButton("Favorilere Ekle")
+        self.favorite_button.setObjectName("muGhostBtn")
+        self.favorite_button.setIcon(icons.icon("star", self.BLUE, 17, stroke=2.0))
+        self.favorite_button.setIconSize(QSize(17, 17))
+        self.favorite_button.setCursor(Qt.PointingHandCursor)
+        self.favorite_button.setEnabled(False)
+        self.favorite_button.clicked.connect(
+            self._add_selected_to_favorites
         )
-        detail_layout.addWidget(self.package_status)
+        self.open_source_button = QPushButton(
+            "Microsoft Sayfasını Aç"
+        )
+        self.open_source_button.setObjectName("muGhostBtn")
+        self.open_source_button.setIcon(icons.icon("external", self.BLUE, 16, stroke=2.0))
+        self.open_source_button.setIconSize(QSize(16, 16))
+        self.open_source_button.setCursor(Qt.PointingHandCursor)
+        self.open_source_button.setEnabled(False)
+        self.open_source_button.clicked.connect(
+            self._open_selected_source
+        )
+        actions.addWidget(self.favorite_button)
+        actions.addWidget(self.open_source_button)
+        actions.addStretch(1)
+        top.addLayout(actions, 0)
+        v.addLayout(top)
+        v.addLayout(chip_row)
+        v.setSpacing(16)
 
-        package_workspace = QFrame()
-        package_workspace.setObjectName("packageWorkspace")
-        package_workspace_layout = QHBoxLayout(package_workspace)
-        package_workspace_layout.setContentsMargins(0, 0, 0, 0)
-        package_workspace_layout.setSpacing(8)
+        # --- Dört bilgi kutusu
+        self.card_version = QLabel("—")
+        self.card_build = QLabel("—")
+        self.card_channel = QLabel("—")
+        self.card_date = QLabel("—")
+        tiles = QHBoxLayout()
+        tiles.setSpacing(14)
+        tiles.addWidget(self._meta_tile("gear-outline", "Sürüm", self.card_version), 1)
+        tiles.addWidget(self._meta_tile("calendar", "Build No", self.card_build), 1)
+        tiles.addWidget(self._meta_tile("cube", "Kanal", self.card_channel), 1)
+        tiles.addWidget(self._meta_tile("clock", "Yayın Tarihi", self.card_date), 1)
+        v.addLayout(tiles)
+
+        # --- İndirme seçenekleri
+        section = QFrame()
+        section.setObjectName("muSection")
+        sv = QVBoxLayout(section)
+        sv.setContentsMargins(0, 0, 0, 14)
+        sv.setSpacing(10)
+        section_title = QLabel("İndirme Seçenekleri")
+        section_title.setObjectName("muSectionTitle")
+        sv.addWidget(section_title)
+
+        # Satır 1: Microsoft paketi
+        row1 = QFrame()
+        row1.setObjectName("muRow")
+        r1 = QHBoxLayout(row1)
+        r1.setContentsMargins(18, 14, 14, 14)
+        r1.setSpacing(14)
+        r1.addWidget(_pix_label("windows-color", size=34), 0, Qt.AlignVCenter)
+        t1 = QVBoxLayout()
+        t1.setSpacing(2)
+        l1 = QLabel("Microsoft Orijinal ISO Linki")
+        l1.setObjectName("muRowTitle")
+        d1 = QLabel("Resmi Microsoft paketlerini bulun ve doğrudan indirin.")
+        d1.setObjectName("muRowDesc")
+        self.package_card_title = l1
+        self.package_card_desc = d1
+        d1.setWordWrap(True)
+        t1.addWidget(l1)
+        t1.addWidget(d1)
+        r1.addLayout(t1, 1)
+
+        self.find_packages_button = QPushButton("Paketleri Bul")
+        self.find_packages_button.setObjectName("muGhostBtn")
+        self.find_packages_button.setCursor(Qt.PointingHandCursor)
+        self.find_packages_button.setEnabled(False)
+        self.find_packages_button.clicked.connect(
+            self._prepare_package_lookup
+        )
+        self.open_package_button = QPushButton(
+            "Microsoft'tan İndir"
+        )
+        self.open_package_button.setObjectName("muPrimaryBtn")
+        self.open_package_button.setIcon(icons.icon("external", "#FFFFFF", 17, stroke=2.1))
+        self.open_package_button.setIconSize(QSize(17, 17))
+        self.open_package_button.setCursor(Qt.PointingHandCursor)
+        self.open_package_button.setEnabled(False)
+        self.open_package_button.clicked.connect(
+            self._open_selected_package
+        )
+        r1.addWidget(self.find_packages_button, 0, Qt.AlignVCenter)
+        r1.addWidget(self.open_package_button, 0, Qt.AlignVCenter)
+        r1.addWidget(_pix_label("chevron-right", "#6E7F99", 18, stroke=2.1), 0, Qt.AlignVCenter)
+
+        # Paket listesi (paketler bulunduğunda açılır)
+        self.package_area = QFrame()
+        self.package_area.setObjectName("muPackageArea")
+        pa = QHBoxLayout(self.package_area)
+        pa.setContentsMargins(14, 14, 14, 14)
+        pa.setSpacing(12)
 
         self.package_list = QListWidget()
         self.package_list.setObjectName("packageList")
@@ -357,55 +659,62 @@ class HomePage(QWidget):
         self.package_list.currentItemChanged.connect(
             self._on_package_item_changed
         )
-        package_workspace_layout.addWidget(self.package_list, 5)
+        pa.addWidget(self.package_list, 5)
 
-        # The previously unused area is now a compact selected-package summary.
         self.package_info_card = QFrame()
         self.package_info_card.setObjectName("packageInfoCard")
         self.package_info_card.setMinimumHeight(116)
-        self.package_info_card.setMaximumHeight(156)
-        self.package_info_card.setSizePolicy(
-            QSizePolicy.Expanding,
-            QSizePolicy.Preferred,
+        self.package_info_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        pi = QVBoxLayout(self.package_info_card)
+        pi.setContentsMargins(12, 10, 12, 10)
+        pi.setSpacing(6)
+
+        pi_head = QHBoxLayout()
+        pi_title = QLabel("Seçili Paket")
+        pi_title.setObjectName("packageInfoTitle")
+        pi_head.addWidget(pi_title)
+        pi_head.addStretch(1)
+        self.copy_package_link_button = QPushButton(
+            "Bağlantıyı Kopyala"
         )
-        package_info_layout = QVBoxLayout(self.package_info_card)
-        package_info_layout.setContentsMargins(10, 8, 10, 8)
-        package_info_layout.setSpacing(5)
+        self.copy_package_link_button.setObjectName("muGhostBtnSmall")
+        self.copy_package_link_button.setCursor(Qt.PointingHandCursor)
+        self.copy_package_link_button.setEnabled(False)
+        self.copy_package_link_button.clicked.connect(
+            self._copy_selected_package_link
+        )
+        pi_head.addWidget(self.copy_package_link_button)
+        pi.addLayout(pi_head)
 
-        package_info_title = QLabel("Seçili Paket")
-        package_info_title.setObjectName("packageInfoTitle")
-        package_info_layout.addWidget(package_info_title)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(5)
 
-        package_quick_grid = QGridLayout()
-        package_quick_grid.setHorizontalSpacing(6)
-        package_quick_grid.setVerticalSpacing(5)
-
-        def add_package_quick_item(caption, value_label, row, column):
-            card = QFrame()
-            card.setObjectName("packageQuickCard")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(7, 5, 7, 5)
-            card_layout.setSpacing(1)
-            caption_label = QLabel(caption)
-            caption_label.setObjectName("packageQuickCaption")
+        def add_quick(caption, value_label, row, column):
+            quick = QFrame()
+            quick.setObjectName("packageQuickCard")
+            ql = QVBoxLayout(quick)
+            ql.setContentsMargins(8, 5, 8, 5)
+            ql.setSpacing(1)
+            cap = QLabel(caption)
+            cap.setObjectName("packageQuickCaption")
             value_label.setObjectName("packageQuickValue")
             value_label.setWordWrap(False)
-            card_layout.addWidget(caption_label)
-            card_layout.addWidget(value_label)
-            package_quick_grid.addWidget(card, row, column)
+            ql.addWidget(cap)
+            ql.addWidget(value_label)
+            grid.addWidget(quick, row, column)
 
         self.package_arch_label = QLabel("—")
         self.package_type_label = QLabel("—")
         self.package_size_label = QLabel("—")
         self.package_link_status = QLabel("—")
-
-        add_package_quick_item("Mimari", self.package_arch_label, 0, 0)
-        add_package_quick_item("Tür", self.package_type_label, 0, 1)
-        add_package_quick_item("Boyut", self.package_size_label, 1, 0)
-        add_package_quick_item("Bağlantı", self.package_link_status, 1, 1)
-        package_quick_grid.setColumnStretch(0, 1)
-        package_quick_grid.setColumnStretch(1, 1)
-        package_info_layout.addLayout(package_quick_grid)
+        add_quick("Mimari", self.package_arch_label, 0, 0)
+        add_quick("Tür", self.package_type_label, 0, 1)
+        add_quick("Boyut", self.package_size_label, 1, 0)
+        add_quick("Bağlantı", self.package_link_status, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        pi.addLayout(grid)
 
         self.package_file_label = QLabel(
             "Paket seçildiğinde dosya adı burada gösterilecek."
@@ -419,88 +728,467 @@ class HomePage(QWidget):
             QSizePolicy.Expanding,
             QSizePolicy.Minimum,
         )
-        package_info_layout.addWidget(self.package_file_label)
+        pi.addWidget(self.package_file_label)
+        pa.addWidget(self.package_info_card, 7)
 
-        package_workspace_layout.addWidget(self.package_info_card, 7)
-        detail_layout.addWidget(package_workspace)
+        # Satır 2: UUP ISO Oluşturucu
+        row2 = QFrame()
+        row2.setObjectName("muRow")
+        r2 = QHBoxLayout(row2)
+        r2.setContentsMargins(18, 14, 14, 14)
+        r2.setSpacing(14)
+        r2.addWidget(_pix_label("cloud-down", self.BLUE, 36, bg="#FFFFFF"), 0, Qt.AlignVCenter)
+        t2 = QVBoxLayout()
+        t2.setSpacing(2)
+        l2 = QLabel("UUP ISO Oluşturucu")
+        l2.setObjectName("muRowTitle")
+        d2 = QLabel("Bu build için UUP kaynakları üzerinden ISO seçeneklerini açın.")
+        d2.setObjectName("muRowDesc")
+        d2.setWordWrap(True)
+        t2.addWidget(l2)
+        t2.addWidget(d2)
+        r2.addLayout(t2, 1)
+        self.uup_go_button = QPushButton("UUP'ye Git")
+        self.uup_go_button.setObjectName("muPrimaryBtn")
+        self.uup_go_button.setCursor(Qt.PointingHandCursor)
+        self.uup_go_button.setEnabled(False)
+        self.uup_go_button.clicked.connect(self._open_uup_for_selected)
+        r2.addWidget(self.uup_go_button, 0, Qt.AlignVCenter)
+        r2.addWidget(_pix_label("chevron-right", "#6E7F99", 18, stroke=2.1), 0, Qt.AlignVCenter)
 
-        # Package action buttons live in the fixed footer below.
-        # Keeping them out of the scroll area makes them permanently visible.
-        detail_layout.addStretch(1)
+        for widget in (row1, self.package_area, row2):
+            wrapper = QHBoxLayout()
+            wrapper.setContentsMargins(14, 0, 14, 0)
+            wrapper.addWidget(widget)
+            sv.addLayout(wrapper)
 
-        self.detail_scroll.setWidget(detail_content)
-        detail_outer_layout.addWidget(self.detail_scroll, 1)
+        # Durum notu (paket arama durumu burada gösterilir)
+        self.note_frame = QFrame()
+        self.note_frame.setObjectName("muNote")
+        self.note_frame.setProperty("ok", False)
+        nl = QHBoxLayout(self.note_frame)
+        nl.setContentsMargins(16, 12, 16, 12)
+        nl.setSpacing(14)
+        self.note_icon = QLabel()
+        self.note_icon.setFixedSize(26, 26)
+        nl.addWidget(self.note_icon, 0, Qt.AlignVCenter)
+        self.package_status = QLabel("Henüz paket aranmadı.")
+        self.package_status.setObjectName("muNoteText")
+        self.package_status.setWordWrap(True)
+        self.package_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        nl.addWidget(self.package_status, 1)
+        note_wrap = QHBoxLayout()
+        note_wrap.setContentsMargins(14, 0, 14, 0)
+        note_wrap.addWidget(self.note_frame)
+        sv.addLayout(note_wrap)
 
-        # Fixed action footer stays visible; only the record/package details
-        # above it scroll when vertical space is limited.
-        detail_footer = QFrame()
-        detail_footer.setObjectName("detailFooter")
-        footer_layout = QVBoxLayout(detail_footer)
-        footer_layout.setContentsMargins(14, 10, 14, 14)
-        footer_layout.setSpacing(8)
+        v.addWidget(section)
+        return card
 
-        fixed_package_action_row = QHBoxLayout()
-        fixed_package_action_row.setSpacing(8)
+    def _about_row(self, caption, value_label):
+        row = QFrame()
+        row.setObjectName("muAboutRow")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 10, 0, 10)
+        lay.setSpacing(10)
+        cap = QLabel(caption)
+        cap.setObjectName("muAboutCap")
+        value_label.setObjectName("muAboutValue")
+        value_label.setWordWrap(True)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        value_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        lay.addWidget(cap, 0, Qt.AlignVCenter)
+        lay.addWidget(value_label, 1)
+        return row
 
-        self.copy_package_link_button = QPushButton(
-            "Bağlantıyı Kopyala"
+    def _build_about_card(self):
+        card = QFrame()
+        card.setObjectName("muCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(20, 18, 20, 18)
+        v.setSpacing(2)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head.addWidget(_pix_label("windows", size=26))
+        title = QLabel("Build Hakkında")
+        title.setObjectName("muCardTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        v.addLayout(head)
+        v.addSpacing(8)
+
+        self.detail_build = QLabel("—")
+        self.detail_version = QLabel("—")
+        self.detail_channel = QLabel("—")
+        self.detail_date = QLabel("—")
+        self.detail_arch = QLabel("—")
+        self.detail_language = QLabel("—")
+        for caption, label in (
+            ("Build Numarası", self.detail_build),
+            ("Sürüm", self.detail_version),
+            ("Kanal", self.detail_channel),
+            ("Yayın Tarihi", self.detail_date),
+            ("Mimari", self.detail_arch),
+            ("Dil", self.detail_language),
+        ):
+            v.addWidget(self._about_row(caption, label))
+
+        v.addSpacing(10)
+        self.warning_box = QFrame()
+        self.warning_box.setObjectName("muWarning")
+        wl = QHBoxLayout(self.warning_box)
+        wl.setContentsMargins(14, 12, 14, 12)
+        wl.setSpacing(12)
+        wl.addWidget(_pix_label("warning", "#F2A600", 26, stroke=1.2), 0, Qt.AlignTop)
+        wt = QVBoxLayout()
+        wt.setSpacing(3)
+        wtitle = QLabel("Uyarı")
+        wtitle.setObjectName("muWarningTitle")
+        wtext = QLabel(
+            "Bu build, test amaçlıdır ve kararlı sürüm değildir. "
+            "Kullanımda kararsızlıklar yaşanabilir."
         )
-        self.copy_package_link_button.setObjectName("fixedPackageActionButton")
-        self.copy_package_link_button.setEnabled(False)
-        self.copy_package_link_button.clicked.connect(
-            self._copy_selected_package_link
+        wtext.setObjectName("muWarningText")
+        wtext.setWordWrap(True)
+        wt.addWidget(wtitle)
+        wt.addWidget(wtext)
+        wl.addLayout(wt, 1)
+        v.addWidget(self.warning_box)
+        return card
+
+    def _quick_item(self, icon_name, title, desc, slot):
+        item = ClickableCard()
+        item.setObjectName("muQuick")
+        lay = QHBoxLayout(item)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+        tile = QLabel()
+        tile.setObjectName("muQuickIcon")
+        tile.setFixedSize(44, 44)
+        tile.setAlignment(Qt.AlignCenter)
+        tile.setPixmap(icons.pixmap(icon_name, self.BLUE, 26, bg="#EAF2FF", stroke=1.8))
+        box = QVBoxLayout()
+        box.setSpacing(2)
+        t = QLabel(title)
+        t.setObjectName("muQuickTitle")
+        t.setWordWrap(True)
+        d = QLabel(desc)
+        d.setObjectName("muQuickDesc")
+        d.setWordWrap(True)
+        box.addWidget(t)
+        box.addWidget(d)
+        lay.addWidget(tile, 0, Qt.AlignVCenter)
+        lay.addLayout(box, 1)
+        lay.addWidget(_pix_label("chevron-right", "#6E7F99", 18, stroke=2.1), 0, Qt.AlignVCenter)
+        item.clicked.connect(slot)
+        return item
+
+    def _build_quick_card(self):
+        card = QFrame()
+        card.setObjectName("muCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 18, 16, 16)
+        v.setSpacing(12)
+        title = QLabel("Hızlı Erişim")
+        title.setObjectName("muCardTitle")
+        title.setContentsMargins(4, 0, 0, 0)
+        v.addWidget(title)
+        v.addWidget(self._quick_item(
+            "shield", "Microsoft Update Kataloğu",
+            "Alternatif kaynaklar ve güncellemeler.", self._open_catalog_site,
+        ))
+        v.addWidget(self._quick_item(
+            "cloud-down", "UUP ISO Oluşturucu",
+            "UUP dosyalarını keşfet ve indir.", self._open_uup_center,
+        ))
+        return card
+
+    def _build_hidden_legacy_widgets(self):
+        # Bilgi kartları (Son Arama / Bulunan Kayıt / Arama Türü / Durum) yeni
+        # tasarımda görünmez; arama mantığı değerlerini güncellemeye devam eder.
+        self.last_search_card = StatCard("Son Arama", "—", "Henüz arama yapılmadı")
+        self.count_card = StatCard("Bulunan Kayıt", "0", "Catalog sonuçları")
+        self.match_card = StatCard("Arama Türü", "Hazır", "KB veya build bekleniyor")
+        self.status_card = StatCard("Durum", "Hazır", "Aramaya hazır")
+        for card in (self.last_search_card, self.count_card, self.match_card, self.status_card):
+            card.setParent(self)
+            card.setVisible(False)
+
+    def _wire_dynamic_visibility(self):
+        model = self.results_table.model()
+        for signal in (model.rowsInserted, model.rowsRemoved, model.modelReset, model.layoutChanged):
+            signal.connect(self._on_results_changed)
+        pmodel = self.package_list.model()
+        for signal in (pmodel.rowsInserted, pmodel.rowsRemoved, pmodel.modelReset):
+            signal.connect(self._sync_package_area)
+
+    # ------------------------------------------------------------------
+    # Görünümle ilgili yardımcılar
+    # ------------------------------------------------------------------
+    def _on_results_changed(self, *args):
+        try:
+            count = self.results_table.rowCount()
+        except RuntimeError:  # pencere kapanırken Qt nesneleri silinmiş olabilir
+            return
+        self.results_title.setText(f"Arama Sonuçları ({count})")
+        self._results_stack.setCurrentIndex(1 if count > 0 else 0)
+
+    def _sync_package_area(self, *args):
+        try:
+            has = self.package_list.count() > 0
+        except RuntimeError:  # pencere kapanırken Qt nesneleri silinmiş olabilir
+            return
+        self.package_area.setVisible(has)
+        self.note_frame.setProperty("ok", has)
+        self.note_icon.setPixmap(
+            icons.pixmap(
+                "check-circle" if has else "info-fill",
+                "#1FA35C" if has else "#5B8FD9",
+                26,
+                bg="#EAF2FF",
+            )
         )
-        fixed_package_action_row.addWidget(self.copy_package_link_button)
+        style = self.note_frame.style()
+        style.unpolish(self.note_frame)
+        style.polish(self.note_frame)
 
-        self.open_package_button = QPushButton(
-            "Microsoft'tan İndir"
+    @staticmethod
+    def _extract_build(item) -> str:
+        for text in (getattr(item, "title", ""), getattr(item, "version", "")):
+            match = re.search(r"\b(\d{5}\.\d{1,5})\b", text or "")
+            if match:
+                return match.group(1)
+        return "—"
+
+    def _refresh_mockup_fields(self, item=None):
+        """Yeni tasarımdaki ek alanları seçili kayda göre günceller."""
+        if item is None:
+            for label in (self.card_version, self.card_build, self.card_channel, self.card_date):
+                label.setText("—")
+            self.detail_build.setText("—")
+            self.detail_language.setText("—")
+            self.build_line.setVisible(False)
+            self.result_badge.setVisible(False)
+            self.warning_box.setVisible(False)
+            self.uup_go_button.setEnabled(False)
+            for chip in self._chips:
+                chip.setVisible(False)
+            return
+
+        build = self._extract_build(item)
+        release = self._extract_release(item.title, item.version)
+        channel = (getattr(item, "channel", "") or "").strip()
+        date = item.last_updated or "—"
+
+        self.card_version.setText(release)
+        self.card_build.setText(build)
+        self.card_channel.setText(channel or "—")
+        self.card_date.setText(date)
+        self.detail_build.setText(build)
+        language = self.language_filter.currentText().replace("Dil: ", "", 1).strip()
+        self.detail_language.setText(language or "—")
+
+        self.result_badge.setVisible(True)
+        self.build_line.setText(build if build != "—" else "")
+        self.build_line.setVisible(build != "—")
+        self.uup_go_button.setEnabled(True)
+
+        low_channel = channel.casefold()
+        is_test_build = any(
+            key in low_channel
+            for key in ("canary", "dev", "beta", "insider", "preview")
         )
-        self.open_package_button.setObjectName("fixedPackageActionButton")
-        self.open_package_button.setEnabled(False)
-        self.open_package_button.clicked.connect(
-            self._open_selected_package
+        self.warning_box.setVisible(is_test_build)
+
+        for chip in self._chips:
+            text = (chip.text() or "").strip()
+            chip.setVisible(text not in ("", "—"))
+
+    def _relayout_responsive(self):
+        width = self.width()
+        wide_cols = width >= 1180
+        wide_filters = width >= 1560
+
+        if wide_cols != self._wide_cols:
+            self._wide_cols = wide_cols
+            self._cols.removeWidget(self._left_col)
+            self._cols.removeWidget(self._right_col)
+            if wide_cols:
+                self._cols.addWidget(self._left_col, 0, 0)
+                self._cols.addWidget(self._right_col, 0, 1, Qt.AlignTop)
+                self._cols.setColumnStretch(1, 0)
+                self._right_col.setFixedWidth(306)
+            else:
+                self._cols.addWidget(self._left_col, 0, 0)
+                self._cols.addWidget(self._right_col, 1, 0)
+                self._right_col.setMinimumWidth(0)
+                self._right_col.setMaximumWidth(16777215)
+
+        if wide_filters != self._wide_filters:
+            self._wide_filters = wide_filters
+            grid = self._results_header
+            grid.removeWidget(self._results_title_box)
+            grid.removeWidget(self._filters_box)
+            for col in range(2):
+                grid.setColumnStretch(col, 0)
+            self._arrange_filters(wide_filters)
+            if wide_filters:
+                grid.addWidget(self._results_title_box, 0, 0)
+                grid.addWidget(self._filters_box, 0, 1)
+                grid.setColumnStretch(1, 1)
+            else:
+                grid.addWidget(self._results_title_box, 0, 0)
+                grid.addWidget(self._filters_box, 1, 0)
+                grid.setColumnStretch(0, 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_responsive()
+
+    def _open_catalog_site(self):
+        webbrowser.open("https://www.catalog.update.microsoft.com/")
+
+    def _open_uup_center(self):
+        window = self.window()
+        if hasattr(window, "show_page_by_name"):
+            window.show_page_by_name("UUP ISO Oluşturucu")
+
+    def _apply_page_styles(self):
+        self.setStyleSheet(
+            styles.qss('''
+            QScrollArea#muScroll { background: transparent; border: none; }
+            QWidget#muContent { background: #F4F7FB; }
+
+            QLabel#muTitle { font-size: 30px; font-weight: 700; color: #0A1F44; }
+            QLabel#muSubtitle { font-size: 14px; color: #5F7090; }
+
+            QLineEdit#muSearch {
+                background: #FFFFFF; border: 1px solid #C7D5E8; border-radius: 11px;
+                padding: 0 14px 0 18px; font-size: 17px; color: #0F2347; min-height: 50px; max-height: 50px;
+                selection-background-color: #1F6FEB;
+            }
+            QLineEdit#muSearch:focus { border: 2px solid #1F6FEB; }
+            QPushButton#muSearchBtn {
+                background: @BLUE@; color: #FFFFFF; border: none; border-radius: 11px;
+                font-size: 15px; font-weight: 700; padding: 0 26px;
+                min-height: 52px; max-height: 52px;
+            }
+            QPushButton#dangerButton { min-height: 50px; max-height: 50px; border-radius: 11px; padding: 0 18px; font-size: 13px; }
+            QPushButton#muSearchBtn:hover { background: #1259C4; }
+            QPushButton#muSearchBtn:disabled { background: #AFC4E6; color: #EEF3FB; }
+
+            QFrame#muCard {
+                background: #FFFFFF; border: 1px solid #DCE5F1; border-radius: 14px;
+            }
+            QWidget#muCardHeader { background: transparent; }
+            QLabel#muCardTitle { font-size: 16px; font-weight: 700; color: #0F2347; }
+            QStackedWidget#muResultsStack { background: transparent; }
+
+            QLabel#muEmptyStatus { font-size: 14px; font-weight: 600; color: #3E5276; }
+            QLabel#muEmptyHint { font-size: 12px; color: #7E8EA8; }
+
+            QTableWidget#muTable {
+                background: #FFFFFF; border: none; border-top: 1px solid #E6EDF6;
+                border-bottom-left-radius: 13px; border-bottom-right-radius: 13px;
+                alternate-background-color: #FAFCFE;
+                selection-background-color: #E4EFFD; selection-color: #0F2347;
+                color: #1B2B48; font-size: 12px; outline: none;
+            }
+            QTableWidget#muTable::item {
+                padding: 4px 10px; border: none; border-bottom: 1px solid #EEF2F8;
+            }
+            QTableWidget#muTable::item:hover { background: #F2F7FE; }
+            QTableWidget#muTable::item:selected,
+            QTableWidget#muTable::item:selected:active,
+            QTableWidget#muTable::item:selected:!active {
+                background: #E4EFFD; color: #0F2347; border-bottom: 1px solid #D5E5FA;
+            }
+            QTableWidget#muTable QHeaderView::section {
+                background: #F6F9FD; color: #51627F; font-size: 12px; font-weight: 700;
+                border: none; border-bottom: 1px solid #E3EAF4; padding: 0 12px;
+            }
+            QTableWidget#muTable QTableCornerButton::section { background: #F6F9FD; border: none; }
+
+            QLabel#muLogoTile {
+                background: #EDF4FE; border: 1px solid #DCE8F8; border-radius: 16px;
+            }
+            QLabel#muBadge {
+                background: #E4F6EA; color: #1C8A4D; border: 1px solid #C4E8D1;
+                border-radius: 9px; padding: 2px 10px; font-size: 11px; font-weight: 600;
+            }
+            QLabel#muSelTitle { font-size: 20px; font-weight: 700; color: #0F2347; }
+            QLabel#muSelBuild { font-size: 17px; font-weight: 500; color: #3C4F72; }
+            QLabel#muChip {
+                background: #F1F5FB; color: #4A5D7A; border: 1px solid #E0E8F3;
+                border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 500;
+            }
+
+            QPushButton#muGhostBtn {
+                background: #FFFFFF; color: #1A5FD0; border: 1px solid #CBD9EC;
+                border-radius: 10px; padding: 8px 16px; font-size: 12px; font-weight: 600;
+                min-height: 20px;
+            }
+            QPushButton#muGhostBtn:hover { background: #F2F7FF; border-color: #9DBBEA; }
+            QPushButton#muGhostBtn:disabled { background: #F6F8FB; color: #9AA9BF; border-color: #E1E8F2; }
+            QPushButton#muGhostBtnSmall {
+                background: #FFFFFF; color: #1A5FD0; border: 1px solid #CBD9EC;
+                border-radius: 8px; padding: 3px 10px; font-size: 11px; font-weight: 600;
+                min-height: 16px;
+            }
+            QPushButton#muGhostBtnSmall:hover { background: #F2F7FF; }
+            QPushButton#muGhostBtnSmall:disabled { background: #F6F8FB; color: #9AA9BF; border-color: #E1E8F2; }
+            QPushButton#muPrimaryBtn {
+                background: @BLUE@; color: #FFFFFF; border: none; border-radius: 10px;
+                padding: 10px 22px; font-size: 13px; font-weight: 700; min-height: 22px;
+                min-width: 118px;
+            }
+            QPushButton#muPrimaryBtn:hover { background: #1259C4; }
+            QPushButton#muPrimaryBtn:disabled { background: #B9CBE8; color: #F2F6FC; }
+
+            QFrame#muMetaCard {
+                background: #FFFFFF; border: 1px solid #DEE7F3; border-radius: 12px;
+            }
+            QLabel#muMetaIcon { background: #EAF2FE; border-radius: 21px; }
+            QLabel#muMetaCaption { font-size: 12px; color: #6E7F99; }
+            QLabel#muMetaValue { font-size: 17px; font-weight: 700; color: #0F2347; }
+
+            QFrame#muSection { background: #F4F7FC; border: 1px solid #E3EAF4; border-radius: 12px; }
+            QLabel#muSectionTitle {
+                font-size: 15px; font-weight: 700; color: #0F2347;
+                padding: 14px 18px 4px 18px;
+            }
+            QFrame#muRow { background: #FFFFFF; border: 1px solid #DCE6F2; border-radius: 11px; }
+            QLabel#muRowTitle { font-size: 14px; font-weight: 700; color: #0F2347; }
+            QLabel#muRowDesc { font-size: 12px; color: #6E7F99; }
+            QFrame#muPackageArea { background: #FFFFFF; border: 1px solid #DCE6F2; border-radius: 11px; }
+
+            QFrame#muNote { background: #EAF2FE; border: 1px solid #CFE0F7; border-radius: 11px; }
+            QFrame#muNote[ok="true"] { background: #E8F6EE; border: 1px solid #C3E6D2; }
+            QLabel#muNoteText { font-size: 12px; color: #34527F; }
+            QFrame#muNote[ok="true"] QLabel#muNoteText { color: #2D6A47; }
+
+            QFrame#muAboutRow { background: transparent; border: none; border-bottom: 1px solid #EEF2F8; }
+            QLabel#muAboutCap { font-size: 13px; color: #6E7F99; }
+            QLabel#muAboutValue { font-size: 13px; font-weight: 700; color: #0F2347; }
+
+            QFrame#muWarning { background: #FFF7E1; border: 1px solid #F4DFA3; border-radius: 11px; }
+            QLabel#muWarningTitle { font-size: 13px; font-weight: 700; color: #1E2A44; }
+            QLabel#muWarningText { font-size: 11px; color: #8A6A1F; }
+
+            QFrame#muQuick { background: #FFFFFF; border: 1px solid #DCE6F2; border-radius: 12px; }
+            QFrame#muQuick:hover { background: #F5F9FF; border-color: #B5CCEE; }
+            QLabel#muQuickIcon { background: #EAF2FE; border-radius: 12px; }
+            QLabel#muQuickTitle { font-size: 13px; font-weight: 700; color: #0F2347; }
+            QLabel#muQuickDesc { font-size: 11px; color: #7787A1; }
+
+            QComboBox#modernComboBox {
+                background: #FFFFFF; border: 1px solid #D0DCEC; border-radius: 10px;
+                padding: 0 24px 0 10px; font-size: 11px; color: #2B3B58; min-height: 38px; max-height: 38px;
+            }
+            QComboBox#modernComboBox[popupOpen="true"] { border: 1px solid #1F6FEB; }
+            ''')
         )
-        fixed_package_action_row.addWidget(self.open_package_button)
-
-        footer_layout.addLayout(fixed_package_action_row)
-
-        self.find_packages_button = QPushButton("Paketleri Bul")
-        self.find_packages_button.setEnabled(False)
-        self.find_packages_button.clicked.connect(
-            self._prepare_package_lookup
-        )
-
-        self.open_source_button = QPushButton(
-            "Microsoft Sayfasını Aç"
-        )
-        self.open_source_button.setEnabled(False)
-        self.open_source_button.clicked.connect(
-            self._open_selected_source
-        )
-
-        self.favorite_button = QPushButton("Favorilere Ekle")
-        self.favorite_button.setEnabled(False)
-        self.favorite_button.clicked.connect(
-            self._add_selected_to_favorites
-        )
-        self.view_favorites_button = QPushButton("Favorilerim")
-        self.view_favorites_button.clicked.connect(self._show_favorites_dialog)
-
-        footer_layout.addWidget(self.find_packages_button)
-        footer_layout.addWidget(self.open_source_button)
-        footer_layout.addWidget(self.favorite_button)
-        footer_layout.addWidget(self.view_favorites_button)
-        detail_outer_layout.addWidget(detail_footer, 0)
-
-        splitter = QSplitter()
-        splitter.setObjectName("resultSplitter")
-        splitter.addWidget(self.results_table)
-        splitter.addWidget(self.detail_panel)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([820, 500])
-
-        layout.addWidget(splitter, 1)
 
     def _detect_query_type(self, query: str) -> str:
         q = query.strip().lower()
@@ -508,6 +1196,8 @@ class HomePage(QWidget):
             return "KB"
         if re.fullmatch(r"\d{4,5}\.\d{1,5}", q):
             return "Build"
+        if parse_version_query(query):
+            return "Sürüm (ISO)"
         return "Genel"
 
     def start_search(self):
@@ -541,7 +1231,9 @@ class HomePage(QWidget):
         self.status_label.setText(f"{query} Microsoft resmi kaynaklarında aranıyor...")
 
         self._thread = QThread(self)
-        self._worker = CatalogSearchWorker(query)
+        arch = self.arch_filter.currentText().replace("Mimari: ", "", 1).strip()
+        iso_archs = ("x64", "ARM64") if arch == "Tümü" else (("ARM64",) if arch == "ARM64" else ("x64",))
+        self._worker = CatalogSearchWorker(query, architectures=iso_archs)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_finished)
@@ -590,6 +1282,11 @@ class HomePage(QWidget):
         if query_type == "Build":
             self.explainer_label.setText(
                 "Bu arama bir build numarasıyla yapıldı. Program Microsoft Update Catalog ile birlikte resmi Microsoft Insider kaynaklarını da kontrol eder. Catalog kaydı yoksa Flight Hub sonucu gösterilebilir."
+            )
+        elif query_type == "Sürüm (ISO)":
+            self.explainer_label.setText(
+                "Bu arama bir Windows sürüm adıyla yapıldı. Listede iki kaynak çıkar: Microsoft'un resmi sitesindeki ISO "
+                "(Microsoft yalnızca güncel sürümü sunar) ve UUP ile hazırlanan en son yayın build'i. Birini seçip ISO Merkezi'nde devam edin."
             )
         elif query_type == "KB":
             self.explainer_label.setText(
@@ -661,6 +1358,16 @@ class HomePage(QWidget):
             parts.append(arch)
         return " • ".join(parts) + " güncellemesi" if parts else "Microsoft Windows güncellemesi"
 
+    def _row_icon(self):
+        if not hasattr(self, "_row_icon_cache"):
+            self._row_icon_cache = icons.icon("windows", size=26)
+        return self._row_icon_cache
+
+    def _chevron_icon(self):
+        if not hasattr(self, "_chevron_icon_cache"):
+            self._chevron_icon_cache = icons.icon("chevron-right", "#7586A0", 18, stroke=2.1)
+        return self._chevron_icon_cache
+
     def _fill_table(self, results):
         self._displayed_results = list(results)
         self._selected_result = None
@@ -680,9 +1387,15 @@ class HomePage(QWidget):
             ]
             for col, value in enumerate(values):
                 table_item = QTableWidgetItem(str(value))
-                if col != 0:
-                    table_item.setTextAlignment(Qt.AlignCenter)
+                if col == 0:
+                    table_item.setIcon(self._row_icon())
+                else:
+                    table_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 self.results_table.setItem(row, col, table_item)
+            arrow_item = QTableWidgetItem()
+            arrow_item.setIcon(self._chevron_icon())
+            arrow_item.setTextAlignment(Qt.AlignCenter)
+            self.results_table.setItem(row, 9, arrow_item)
 
 
     def _on_selection_changed(self):
@@ -719,6 +1432,11 @@ class HomePage(QWidget):
         self.detail_product.setText("—")
         self.detail_source.setText("—")
         self.detail_channel.setText("—")
+        self.package_card_title.setText("Microsoft Güncelleme Paketi")
+        self.package_card_desc.setText(
+            "Resmi Microsoft güncelleme paketini (MSU/CAB) bulun ve indirin. Bu bir ISO değildir; "
+            "ISO için aşağıdaki UUP ISO Oluşturucu'yu kullanın."
+        )
         self.find_packages_button.setEnabled(False)
         self.open_source_button.setEnabled(False)
         self.favorite_button.setEnabled(False)
@@ -728,6 +1446,7 @@ class HomePage(QWidget):
         self.copy_package_link_button.setEnabled(False)
         self.package_status.setText("Henüz paket aranmadı.")
         self.open_package_button.setEnabled(False)
+        self._refresh_mockup_fields(None)
 
     def _update_detail_panel(self, item):
         self.detail_name.setText(self._display_title(item))
@@ -742,10 +1461,24 @@ class HomePage(QWidget):
         self.detail_channel.setText(getattr(item, "channel", "") or "—")
 
         kb_value = self._extract_kb(item.title)
-        if kb_value == "—":
-            self.find_packages_button.setText("UUP / ISO Seçenekleri")
+        is_uup_iso = self._is_iso_row(item)
+        if is_uup_iso:
+            self.package_card_title.setText("Windows ISO (Microsoft / UUP)")
+            self.package_card_desc.setText(
+                "Microsoft'tan İndir, ISO Merkezi'ni açar. Dil ve mimariyi seçip indirmeyi başlatırsınız; program önce Microsoft'un "
+                "resmi ISO'sunu dener, sürümü sunmuyorsa ya da isteği reddederse ISO'yu UUP ile kendisi hazırlar."
+            )
+            self.find_packages_button.setText("ISO Seçenekleri")
         else:
-            self.find_packages_button.setText("Paketleri Bul")
+            self.package_card_title.setText("Microsoft Güncelleme Paketi")
+            self.package_card_desc.setText(
+                "Resmi Microsoft güncelleme paketini (MSU/CAB) bulun ve indirin. Bu bir ISO değildir; "
+                "ISO için aşağıdaki UUP ISO Oluşturucu'yu kullanın."
+            )
+            if kb_value == "—":
+                self.find_packages_button.setText("UUP / ISO Seçenekleri")
+            else:
+                self.find_packages_button.setText("Paketleri Bul")
         self.find_packages_button.setEnabled(True)
         self.open_source_button.setEnabled(
             bool(getattr(item, "source_url", ""))
@@ -753,10 +1486,109 @@ class HomePage(QWidget):
         self.favorite_button.setEnabled(True)
         self.package_list.clear()
         self.package_status.setText("Henüz paket aranmadı.")
-        self.open_package_button.setEnabled(False)
+        self.open_package_button.setEnabled(is_uup_iso)
+        self._refresh_mockup_fields(item)
+
+    def _open_uup_for_selected(self):
+        """Seçili kaydı UUP / ISO Merkezi'ne build bağlamıyla taşır."""
+        if self._selected_result is None:
+            return
+
+        if getattr(self._selected_result, "source", "") == "Microsoft ISO":
+            show_message(
+                self, "UUP / ISO Merkezi", "Bu kayıt Microsoft'un resmi ISO'su",
+                "Bu kaydın bir build numarası yok. UUP ile hazırlamak için listedeki UUP satırını seçin ya da ISO Merkezi'nde Kaynak: UUP'yi seçin.",
+            )
+            return
+
+        kb = self._extract_kb(self._selected_result.title)
+        is_uup_iso = getattr(self._selected_result, "source", "") == "Microsoft UUP"
+        if is_uup_iso:
+            build = self._extract_build(self._selected_result)
+        elif kb == "—":
+            build = self._extract_release(
+                self._selected_result.title,
+                self._selected_result.version,
+            )
+        else:
+            build = self._extract_build(self._selected_result)
+            if build == "—":
+                build = self._extract_release(
+                    self._selected_result.title,
+                    self._selected_result.version,
+                )
+        window = self.window()
+        try:
+            uup_page = window.page_by_name("UUP ISO Oluşturucu") if hasattr(window, "page_by_name") else None
+            if uup_page is None:
+                raise RuntimeError("UUP ISO Oluşturucu bulunamadı.")
+            if hasattr(uup_page, "set_build_context"):
+                uup_page.set_build_context(
+                    build,
+                    self._selected_result.title,
+                    getattr(self._selected_result, "channel", ""),
+                    getattr(self._selected_result, "source", ""),
+                )
+            if is_uup_iso:
+                # Update Center'da seçilen mimari ve dil, UUP sayfasında hazır gelsin.
+                self._preselect_uup_options(uup_page, self._selected_result.architecture)
+            if hasattr(window, "show_page_by_name"):
+                window.show_page_by_name("UUP ISO Oluşturucu")
+        except Exception:
+            show_message(
+                self,
+                "UUP / ISO Merkezi",
+                "Bu build KB tabanlı değil",
+                "Seçili Insider build için doğrudan KB bulunamadı. UUP / ISO Merkezi üzerinden devam edin.",
+            )
+
+    ISO_SOURCES = ("Microsoft ISO", "Microsoft UUP")
+
+    @classmethod
+    def _is_iso_row(cls, item) -> bool:
+        return getattr(item, "source", "") in cls.ISO_SOURCES
+
+    def _open_iso_center_for_selected(self):
+        """ISO satırını ISO Merkezi'ndeki 'ISO İndir' paneline taşır (dil, mimari orada seçilir)."""
+        item = self._selected_result
+        if item is None:
+            return
+        window = self.window()
+        iso_page = window.page_by_name("ISO Merkezi") if hasattr(window, "page_by_name") else None
+        if iso_page is None or not hasattr(iso_page, "set_download_context"):
+            show_message(self, "ISO Merkezi", "ISO Merkezi açılamadı", "ISO Merkezi sayfası bulunamadı.")
+            return
+        language = self.language_filter.currentText().replace("Dil: ", "", 1).strip()
+        iso_page.set_download_context(
+            "auto",
+            version=item.version,
+            build=(self._extract_build(item) if self._extract_build(item) != "—" else ""),
+            architecture=item.architecture,
+            language=None if language in ("", "Tümü") else language,
+        )
+        if hasattr(window, "show_page_by_name"):
+            window.show_page_by_name("ISO Merkezi")
+
+    def _preselect_uup_options(self, uup_page, architecture: str) -> None:
+        picks = []
+        if architecture in ("x64", "ARM64", "x86"):
+            picks.append((getattr(uup_page, "arch_combo", None), architecture))
+        language = self.language_filter.currentText().replace("Dil: ", "", 1).strip()
+        if language and language != "Tümü":
+            picks.append((getattr(uup_page, "language_combo", None), language))
+        for combo, text in picks:
+            if combo is None:
+                continue
+            index = combo.findText(text)
+            if index >= 0:
+                combo.setCurrentIndex(index)
 
     def _prepare_package_lookup(self):
         if self._selected_result is None:
+            return
+
+        if self._is_iso_row(self._selected_result):
+            self._open_iso_center_for_selected()
             return
 
         kb = self._extract_kb(
@@ -764,31 +1596,7 @@ class HomePage(QWidget):
         )
 
         if kb == "—":
-            build = self._extract_release(
-                self._selected_result.title,
-                self._selected_result.version,
-            )
-            window = self.window()
-            try:
-                uup_page = window.page_by_name("UUP Merkezi") if hasattr(window, "page_by_name") else None
-                if uup_page is None:
-                    raise RuntimeError("UUP Merkezi bulunamadı.")
-                if hasattr(uup_page, "set_build_context"):
-                    uup_page.set_build_context(
-                        build,
-                        self._selected_result.title,
-                        getattr(self._selected_result, "channel", ""),
-                        getattr(self._selected_result, "source", ""),
-                    )
-                if hasattr(window, "show_page_by_name"):
-                    window.show_page_by_name("UUP Merkezi")
-            except Exception:
-                show_message(
-                    self,
-                    "UUP / ISO Merkezi",
-                    "Bu build KB tabanlı değil",
-                    "Seçili Insider build için doğrudan KB bulunamadı. UUP / ISO Merkezi üzerinden devam edin.",
-                )
+            self._open_uup_for_selected()
             return
 
         if (
@@ -1014,6 +1822,11 @@ class HomePage(QWidget):
         self,
         *args,
     ):
+        if self._is_iso_row(self._selected_result):
+            # ISO kayıtlarında bu düğme ISO Merkezi'ne götürür (dil, mimari orada seçilir, indirme orada başlar).
+            self._open_iso_center_for_selected()
+            return
+
         current = self.package_list.currentItem()
         if current is None:
             return
@@ -1079,77 +1892,21 @@ class HomePage(QWidget):
             values = [str(row[0]) for row in rows if row and row[0]]
             completer = QCompleter(values, self.search_input)
             completer.setCaseSensitivity(Qt.CaseInsensitive)
-            completer.setFilterMode(Qt.MatchContains)
+            # Yazılan ifadeyle başlayan geçmiş aramalar tamamlayıcı olarak önerilir.
+            completer.setFilterMode(Qt.MatchStartsWith)
+            completer.setMaxVisibleItems(8)
+            popup = completer.popup()
+            popup.setItemDelegate(CompletionDelegate(self.search_input, popup))
+            popup.setMouseTracking(True)
+            popup.setFrameShape(QFrame.NoFrame)
+            popup.setStyleSheet(
+                "QListView { background: #FFFFFF; border: 1px solid #B9CCE8;"
+                " border-radius: 10px; padding: 4px; outline: none; }"
+            )
             self.search_input.setCompleter(completer)
             self._search_completer = completer
         except Exception:
             self._search_completer = None
-
-    def _show_favorites_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Favorilerim")
-        dialog.resize(720, 430)
-        layout = QVBoxLayout(dialog)
-        info = QLabel("Kaydettiğiniz güncelleme kayıtlarını buradan açabilir veya silebilirsiniz.")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-        listing = QListWidget()
-        layout.addWidget(listing, 1)
-
-        def reload_items():
-            listing.clear()
-            with get_connection() as conn:
-                rows = conn.execute(
-                    "SELECT id, title, metadata_json FROM favorites ORDER BY id DESC"
-                ).fetchall()
-            for fav_id, title, metadata_json in rows:
-                item = QListWidgetItem(str(title))
-                try:
-                    metadata = json.loads(metadata_json or "{}")
-                except Exception:
-                    metadata = {}
-                item.setData(Qt.UserRole, {
-                    "id": fav_id,
-                    "url": metadata.get("source_url", ""),
-                })
-                listing.addItem(item)
-
-        buttons = QHBoxLayout()
-        open_btn = QPushButton("Microsoft Sayfasını Aç")
-        delete_btn = QPushButton("Favoriden Sil")
-        close_btn = QPushButton("Kapat")
-        buttons.addWidget(open_btn)
-        buttons.addWidget(delete_btn)
-        buttons.addStretch()
-        buttons.addWidget(close_btn)
-        layout.addLayout(buttons)
-
-        def open_selected():
-            item = listing.currentItem()
-            data = item.data(Qt.UserRole) if item else {}
-            url = (data or {}).get("url", "")
-            if url:
-                webbrowser.open(url)
-            else:
-                show_information(dialog, "Favoriler", "Bu kayıt için Microsoft kaynak bağlantısı bulunmuyor.")
-
-        def delete_selected():
-            item = listing.currentItem()
-            data = item.data(Qt.UserRole) if item else {}
-            fav_id = (data or {}).get("id")
-            if not fav_id:
-                return
-            with get_connection() as conn:
-                conn.execute("DELETE FROM favorites WHERE id = ?", (fav_id,))
-                conn.commit()
-            reload_items()
-
-        open_btn.clicked.connect(open_selected)
-        delete_btn.clicked.connect(delete_selected)
-        close_btn.clicked.connect(dialog.accept)
-        listing.itemDoubleClicked.connect(lambda _item: open_selected())
-        reload_items()
-        dialog.exec()
 
     def _add_selected_to_favorites(self):
         if self._selected_result is None:
@@ -1266,7 +2023,12 @@ class HomePage(QWidget):
         self.status_card.value_label.setText("Tamamlandı")
         self.status_card.note_label.setText("Arama başarıyla tamamlandı")
 
-        if results:
+        if results and all(self._is_iso_row(r) for r in results):
+            self.status_label.setText(
+                f"{query} için ISO bulundu. Seçip Microsoft'tan İndir'e basın; dil ve mimariyi ISO Merkezi'nde seçersiniz. "
+                "Program önce Microsoft'un sitesinden dener, yoksa UUP ile hazırlar."
+            )
+        elif results:
             self.status_label.setText(f"{query} için {len(results)} güncelleme kaydı bulundu.")
         else:
             self.status_label.setText(
@@ -1285,6 +2047,7 @@ class HomePage(QWidget):
             self._refresh_search_completer()
         except Exception:
             pass
+        self.search_completed.emit()
 
     def _on_failed(self, message):
         self.search_button.setEnabled(True)
@@ -1296,7 +2059,8 @@ class HomePage(QWidget):
         show_warning(
             self,
             "Arama tamamlanamadı",
-            message + "\n\nNot: Insider build'leri Microsoft Update Catalog'da bulunmayabilir; program Flight Hub'ı da kontrol eder."
+            message if parse_version_query(self.search_input.text())
+            else message + "\n\nNot: Insider build'leri Microsoft Update Catalog'da bulunmayabilir; program Flight Hub'ı da kontrol eder."
         )
 
     def _cleanup_thread(self):

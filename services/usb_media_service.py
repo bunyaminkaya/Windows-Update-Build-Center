@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import concurrent.futures
+import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from ctypes import wintypes
 from typing import Callable
+from xml.sax.saxutils import escape as _xml_escape
 
 
 class _TransferEstimator:
@@ -94,6 +97,135 @@ class UsbDrive:
     def display_name(self) -> str:
         letter = f" • {self.drive_letter}:" if self.drive_letter else ""
         return f"Disk {self.disk_number} • {self.friendly_name} • {self.size_text}{letter}"
+
+
+_INVALID_ACCOUNT_CHARS = set('"/\\[]:;|=,+*?<>')
+_RESERVED_ACCOUNT_NAMES = {
+    "administrator", "guest", "defaultaccount", "wdagutilityaccount", "system", "krbtgt", "none",
+}
+_SHA256_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
+
+
+def normalize_sha256(text: str) -> str:
+    """Kullanıcının yapıştırdığı SHA-256 değerini (boşluk/tire/küçük harf toleranslı) 64 haneli BÜYÜK harfe çevirir.
+
+    Boş metin boş döner (karşılaştırma istenmedi). Geçersizse ValueError.
+    """
+    cleaned = re.sub(r"[\s\-:]", "", text or "")
+    if not cleaned:
+        return ""
+    if not _SHA256_RE.match(cleaned):
+        raise ValueError("SHA-256 değeri 64 haneli onaltılık (0-9, A-F) bir metin olmalıdır.")
+    return cleaned.upper()
+
+
+@dataclass(frozen=True)
+class InstallCustomization:
+    """Kurulum öncesi özelleştirme seçenekleri; USB'ye ``autounattend.xml`` olarak yazılır."""
+
+    bypass_hardware: bool = False   # TPM 2.0 / Secure Boot / RAM denetimlerini atla
+    local_account: str = ""         # boş değilse: Microsoft hesabı yerine bu adla yerel yönetici hesabı
+    skip_privacy: bool = False      # gizlilik / ekspres ayar sayfalarını atla
+    computer_name: str = ""         # boş değilse bilgisayar adı
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.bypass_hardware or self.local_account or self.skip_privacy or self.computer_name)
+
+    def validate(self) -> None:
+        """Geçersiz değerlerde ValueError (Türkçe, kullanıcıya gösterilebilir) fırlatır."""
+        name = self.local_account.strip()
+        if self.local_account and not name:
+            raise ValueError("Yerel hesap adı boş olamaz.")
+        if name:
+            if len(name) > 20:
+                raise ValueError("Yerel hesap adı en çok 20 karakter olabilir.")
+            bad = sorted({c for c in name if c in _INVALID_ACCOUNT_CHARS or ord(c) < 32})
+            if bad:
+                raise ValueError("Yerel hesap adında şu karakterler kullanılamaz: " + " ".join(bad))
+            if name.strip(". ") == "" or self.local_account != self.local_account.strip():
+                raise ValueError("Yerel hesap adı yalnızca nokta/boşluk olamaz ve boşlukla başlayıp bitemez.")
+            if name.lower() in _RESERVED_ACCOUNT_NAMES:
+                raise ValueError(f"'{name}' Windows'a ayrılmış bir hesap adıdır; başka bir ad seçin.")
+        host = self.computer_name.strip()
+        if self.computer_name and not host:
+            raise ValueError("Bilgisayar adı boş olamaz.")
+        if host:
+            if len(host) > 15:
+                raise ValueError("Bilgisayar adı en çok 15 karakter olabilir.")
+            if not re.fullmatch(r"[A-Za-z0-9-]+", host):
+                raise ValueError("Bilgisayar adında yalnızca harf (a-z), rakam ve tire kullanılabilir; Türkçe karakter ve boşluk olmaz.")
+            if host.isdigit():
+                raise ValueError("Bilgisayar adı yalnızca rakamlardan oluşamaz.")
+            if host.startswith("-") or host.endswith("-"):
+                raise ValueError("Bilgisayar adı tireyle başlayıp bitemez.")
+
+    def summary_lines(self) -> list[str]:
+        lines = []
+        if self.bypass_hardware:
+            lines.append("TPM 2.0, Secure Boot ve RAM denetimleri atlanacak")
+        if self.local_account:
+            lines.append(f"Yerel hesap: {self.local_account.strip()} (parolasız; ilk girişte parola belirleyebilirsiniz)")
+        if self.skip_privacy:
+            lines.append("Gizlilik ve ekspres ayar sayfaları atlanacak")
+        if self.computer_name:
+            lines.append(f"Bilgisayar adı: {self.computer_name.strip()}")
+        return lines
+
+    def build_xml(self, architecture: str = "amd64") -> str:
+        """Seçeneklere göre ``autounattend.xml`` metnini üretir. Disk bölümleme sorularına dokunmaz."""
+        self.validate()
+        arch = architecture if architecture in ("amd64", "x86", "arm64") else "amd64"
+        ns = ('processorArchitecture="%s" publicKeyToken="31bf3856ad364e35" language="neutral" '
+              'versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"' % arch)
+        passes: list[str] = []
+        if self.bypass_hardware:
+            cmds = []
+            for order, value in enumerate(("BypassTPMCheck", "BypassSecureBootCheck", "BypassRAMCheck"), start=1):
+                cmds.append(
+                    f'        <RunSynchronousCommand wcm:action="add"><Order>{order}</Order>'
+                    f'<Path>reg.exe add "HKLM\\SYSTEM\\Setup\\LabConfig" /v {value} /t REG_DWORD /d 1 /f</Path>'
+                    f'</RunSynchronousCommand>'
+                )
+            passes.append(
+                '  <settings pass="windowsPE">\n'
+                f'    <component name="Microsoft-Windows-Setup" {ns}>\n'
+                '      <RunSynchronous>\n' + "\n".join(cmds) + '\n      </RunSynchronous>\n'
+                '    </component>\n  </settings>'
+            )
+        host = self.computer_name.strip()
+        if host:
+            passes.append(
+                '  <settings pass="specialize">\n'
+                f'    <component name="Microsoft-Windows-Shell-Setup" {ns}>\n'
+                f'      <ComputerName>{_xml_escape(host)}</ComputerName>\n'
+                '    </component>\n  </settings>'
+            )
+        account = self.local_account.strip()
+        if account or self.skip_privacy:
+            oobe = []
+            if account:
+                oobe.append("        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>")
+            if self.skip_privacy:
+                oobe.append("        <ProtectYourPC>3</ProtectYourPC>")
+            body = "      <OOBE>\n" + "\n".join(oobe) + "\n      </OOBE>\n"
+            if account:
+                safe = _xml_escape(account)
+                body += (
+                    "      <UserAccounts>\n        <LocalAccounts>\n"
+                    '          <LocalAccount wcm:action="add">\n'
+                    f"            <Name>{safe}</Name>\n            <DisplayName>{safe}</DisplayName>\n"
+                    "            <Group>Administrators</Group>\n"
+                    "            <Password><Value></Value><PlainText>true</PlainText></Password>\n"
+                    "          </LocalAccount>\n        </LocalAccounts>\n      </UserAccounts>\n"
+                )
+            passes.append(
+                '  <settings pass="oobeSystem">\n'
+                f'    <component name="Microsoft-Windows-Shell-Setup" {ns}>\n' + body +
+                '    </component>\n  </settings>'
+            )
+        return ('<?xml version="1.0" encoding="utf-8"?>\n'
+                '<unattend xmlns="urn:schemas-microsoft-com:unattend">\n' + "\n".join(passes) + "\n</unattend>\n")
 
 
 class UsbMediaService:
@@ -1309,21 +1441,76 @@ if ($part) {{ [string]$part.DriveLetter }}'''
         on_progress(100, "100% • Windows dosyaları hazır")
 
     @staticmethod
-    def _write_hardware_bypass(target_root: Path) -> None:
-        xml = r'''<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
-  <settings pass="windowsPE">
-    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <RunSynchronous>
-        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add"><Order>3</Order><Path>reg.exe add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
-      </RunSynchronous>
-    </component>
-  </settings>
-</unattend>
-'''
+    def _write_unattend(target_root: Path, customization: InstallCustomization, architecture: str = "amd64") -> None:
+        """``autounattend.xml`` dosyasını UTF-8 (BOM'suz) yazar."""
+        xml = customization.build_xml(architecture)
         (target_root / "autounattend.xml").write_text(xml, encoding="utf-8")
+
+    @classmethod
+    def _write_hardware_bypass(cls, target_root: Path) -> None:
+        cls._write_unattend(target_root, InstallCustomization(bypass_hardware=True))
+
+    @staticmethod
+    def detect_architecture(iso_path: Path) -> str:
+        """ISO dosya adından mimariyi tahmin eder (autounattend bileşen mimarisi için)."""
+        name = iso_path.name.lower()
+        if "arm64" in name:
+            return "arm64"
+        if re.search(r"(?<![a-z0-9])x86(?![a-z0-9_]*64)", name) and "x64" not in name:
+            return "x86"
+        return "amd64"
+
+    @staticmethod
+    def compute_sha256(
+        path: Path,
+        on_progress: Callable[[int, str], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        """Dosyanın SHA-256 değerini (BÜYÜK harf) hesaplar; ilerleme yüzdesi ve hız bildirir, iptal edilebilir."""
+        on_progress = on_progress or (lambda _p, _t: None)
+        cancelled = cancelled or (lambda: False)
+        total = path.stat().st_size
+        digest = hashlib.sha256()
+        done = 0
+        started = time.monotonic()
+        last_report = 0.0
+        with path.open("rb") as handle:
+            while True:
+                if cancelled():
+                    raise RuntimeError("İşlem kullanıcı tarafından iptal edildi.")
+                chunk = handle.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                done += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 0.4:
+                    last_report = now
+                    percent = int(done * 100 / total) if total else 100
+                    speed = done / max(now - started, 0.001)
+                    on_progress(percent, f"SHA-256 hesaplanıyor • %{percent} • {speed / 1024**2:.0f} MB/sn")
+        on_progress(100, "SHA-256 hesaplandı")
+        return digest.hexdigest().upper()
+
+    @classmethod
+    def verify_iso_sha256(
+        cls,
+        iso_path: Path,
+        expected: str = "",
+        *,
+        on_progress: Callable[[int, str], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> str:
+        """ISO'nun SHA-256 değerini hesaplar; ``expected`` verilmişse eşleşmeyi doğrular. Değeri döner."""
+        wanted = normalize_sha256(expected)
+        actual = cls.compute_sha256(iso_path, on_progress, cancelled)
+        if wanted and actual != wanted:
+            raise RuntimeError(
+                "ISO dosyasının SHA-256 değeri beklenen değerle eşleşmiyor. Dosya eksik/bozuk indirilmiş veya "
+                "değiştirilmiş olabilir. USB'ye dokunulmadı.\n"
+                f"Beklenen: {wanted}\nBulunan:  {actual}"
+            )
+        return actual
 
     @classmethod
     def _make_mbr_bootable(cls, source_root: Path, target_letter: str) -> None:
@@ -1347,6 +1534,9 @@ if ($part) {{ [string]$part.DriveLetter }}'''
         label: str,
         bypass_hardware_checks: bool,
         *,
+        customization: InstallCustomization | None = None,
+        verify_sha256: bool = False,
+        expected_sha256: str = "",
         on_stage: Callable[[int, str], None] | None = None,
         on_log: Callable[[str], None] | None = None,
         on_progress: Callable[[int, str], None] | None = None,
@@ -1358,15 +1548,25 @@ if ($part) {{ [string]$part.DriveLetter }}'''
         cancelled = cancelled or (lambda: False)
 
         cls.validate_iso(iso_path)
+        options = customization or InstallCustomization()
+        if bypass_hardware_checks and not options.bypass_hardware:
+            options = InstallCustomization(True, options.local_account, options.skip_privacy, options.computer_name)
+        options.validate()          # hatalı değerler USB'ye dokunmadan önce yakalanır
+        wanted_hash = normalize_sha256(expected_sha256)
         file_system = cls.resolve_file_system(partition_scheme, requested_file_system)
         cls.validate_target(drive, iso_path, file_system)
         if not cls.is_supported_platform():
-            raise RuntimeError("USB Kurulum Merkezi yalnızca Windows üzerinde çalışır.")
+            raise RuntimeError("USB Kurulum Aracı yalnızca Windows üzerinde çalışır.")
         iso_letter = ""
         try:
             on_stage(1, "ISO ve USB doğrulanıyor")
             if cancelled():
                 raise RuntimeError("İşlem kullanıcı tarafından iptal edildi.")
+            if verify_sha256 or wanted_hash:
+                on_log("ISO'nun SHA-256 değeri hesaplanıyor (USB'ye henüz dokunulmadı)…")
+                actual_hash = cls.verify_iso_sha256(iso_path, wanted_hash, on_progress=on_progress, cancelled=cancelled)
+                on_log(f"ISO SHA-256: {actual_hash}")
+                on_log("Beklenen değerle eşleşti ✓" if wanted_hash else "Beklenen değer girilmedi; değeri kaynakla karşılaştırabilirsiniz.")
             iso_letter = cls._mount_iso(iso_path)
             source_root = Path(f"{iso_letter}:\\")
             on_log(f"ISO bağlandı: {iso_letter}:\\")
@@ -1407,12 +1607,16 @@ if ($part) {{ [string]$part.DriveLetter }}'''
             elif not (target_root / "EFI" / "BOOT").exists():
                 raise RuntimeError("ISO içinde UEFI önyükleme dosyaları bulunamadı.")
 
-            on_stage(5, "Windows 11 uyumluluk seçenekleri uygulanıyor")
-            if bypass_hardware_checks:
-                cls._write_hardware_bypass(target_root)
-                on_log("TPM 2.0, Secure Boot ve RAM kontrollerini atlama profili eklendi.")
+            on_stage(5, "Kurulum seçenekleri uygulanıyor")
+            if not options.is_empty:
+                if (target_root / "autounattend.xml").exists():
+                    on_log("ISO içindeki autounattend.xml, seçtiğiniz özelleştirmeyle değiştirildi.")
+                arch = cls.detect_architecture(iso_path)
+                cls._write_unattend(target_root, options, arch)
+                for line in options.summary_lines():
+                    on_log("Kurulum seçeneği: " + line)
             else:
-                (target_root / "autounattend.xml").unlink(missing_ok=True)
+                on_log("Kurulum özelleştirmesi seçilmedi; ISO'nun kendi kurulum yapısı korunuyor.")
 
             on_stage(6, "Kurulum medyası doğrulanıyor")
             required = [target_root / "sources", target_root / "boot"]

@@ -110,6 +110,12 @@ class IsoBuildWorker(QObject):
             pass
         return total
 
+    @staticmethod
+    def required_space_for_size(uup_size: int) -> int:
+        """UUP paketleri `uup_size` bayt olduğunda ISO dönüştürme için gereken çalışma alanı (tahmin)."""
+        gib = 1024 ** 3
+        return max(24 * gib, int(uup_size * 3.25) + 8 * gib)
+
     @classmethod
     def estimate_required_free_space(cls, uup_dir: Path) -> int:
         """Conservative workspace estimate for UUP -> WIM/ISO conversion.
@@ -121,7 +127,7 @@ class IsoBuildWorker(QObject):
         gib = 1024 ** 3
         uup_size = cls._directory_size(uup_dir)
         # Keep at least 24 GiB available; larger UUP sets scale up automatically.
-        return max(24 * gib, int(uup_size * 3.25) + 8 * gib)
+        return cls.required_space_for_size(uup_size)
 
     def _check_disk_space(self, project_dir: Path, uup_dir: Path):
         required = self.estimate_required_free_space(uup_dir)
@@ -904,6 +910,23 @@ class IsoBuildManager(QObject):
         self.status_changed.emit(batch_id, "ISO oluşturma kuyruğuna eklendi...")
         self._pump_queue()
 
+    READY_STATUS = "İndirme Tamamlandı"
+
+    def mark_ready(self, batch_id: str, metadata: dict):
+        """İndirme bitti ama ISO otomatik başlatılmayacak: kullanıcı düğmeyle başlatır."""
+        metadata = dict(metadata or {})
+        with self._lock:
+            if batch_id in self._threads or batch_id in self._queue:
+                return
+            previous = self._states.get(batch_id, {})
+            if previous.get("status") == "Hazır":
+                return
+            self._set_state(
+                batch_id, status=self.READY_STATUS,
+                message="İndirme tamamlandı; ISO'yu oluşturmak için düğmeye basın",
+                iso_path="", sha256="", metadata=metadata or previous.get("metadata", {}),
+            )
+
     def retry_build(self, batch_id: str):
         state = self._states.get(batch_id, {})
         metadata = dict(state.get("metadata", {}) or {})
@@ -1006,6 +1029,15 @@ class IsoBuildManager(QObject):
         self._threads[batch_id] = thread
         self._workers[batch_id] = worker
         thread.start()
+
+    def shutdown(self, timeout_ms: int = 1500) -> None:
+        """Program kapanırken iş parçacıklarının "çalışırken yok edildi" hatasıyla çökmesini önler."""
+        for thread in list(self._threads.values()):
+            try:
+                thread.quit()
+                thread.wait(300)  # çalışan dönüştürme süreci bilerek kesilmez; süreç sonlanırken bırakılır
+            except RuntimeError:
+                pass
 
     def _on_status(self, batch_id: str, message: str):
         lower = message.lower()
