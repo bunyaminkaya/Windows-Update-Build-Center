@@ -6,7 +6,7 @@
 
 Windows Update & Build Center is a Windows desktop application for discovering Windows builds, searching official Microsoft update packages, downloading UUP/KB content, managing downloads, creating ISO media and preparing bootable USB installation drives from a single interface.
 
-**Current version:** v6.05  
+**Current version:** v6.06  
 **Developer:** Bünyamin KAYA  
 **Website:** bunyaminkaya.com  
 **Contact:** bunyaminkaya@gmail.com

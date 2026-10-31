@@ -1,3 +1,15 @@
+# v6.06 — Sürüm adıyla ISO arama, otomatik ISO oluşturma, sürücü yedekleme ve USB iyileştirmeleri
+
+- **Sürüm adıyla ISO arama** (ör. `26h2`): mimariye göre tek sonuç; ISO Merkezi'nin "Otomatik" kaynağı önce Microsoft'u dener, sunulmuyorsa ya da istek reddedilirse UUP'ye geçer. Reddedilme 24 saat hatırlanır.
+- **İndirme Yöneticisi:** "İndirme İşlemleri"nin altında yeni "ISO Oluşturma" paneli. İndirme bitince ISO otomatik oluşturulur; Ayarlar > UUP / ISO'daki "İndirme bitince ISO'yu otomatik oluştur" seçeneğiyle kapatılabilir (varsayılan açık).
+- UUP indirmesi başlamadan önce boş disk alanı kontrol edilir.
+- **Sürücü Yedekleme:** tahmini yedek boyutu gösterilir, USB'de yer yoksa işlem başlamaz; geri yükleme sonucu günlükten de okunur (başarılı geri yükleme artık "sonucu okunamadı" demez).
+- **USB Kurulum Aracı:** durum alanı yeniden tasarlandı (büyük yüzde, okunaklı ilerleme çubuğu, aşama adı); işlem günlüğü düğmelere kadar uzanır.
+- Yükleme ekranındaki kırpılan boş durum metinleri düzeltildi.
+- Yeni slogan: "Bul. İndir. Hazırla. Kur." (İngilizce: "Find. Download. Prepare. Install.").
+- Yardım bölümü baştan yazıldı.
+- Testler: toplam 180.
+
 # v6.05 — ISO Merkezi tamamlandı ve uygulama içi Yardım sayfası
 
 - **ISO Merkezi kalıyor ve tamamlandı** (kenar çubuğunda "ISO Merkezi", USB Kurulum Aracı'ndan önce):
